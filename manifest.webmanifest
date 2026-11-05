@@ -1,0 +1,17 @@
+{
+  "name": "写真保管庫",
+  "short_name": "写真保管庫",
+  "description": "Google ドライブに保管した写真・動画を、撮影日順に自分だけで見るアプリ",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f141c",
+  "theme_color": "#182642",
+  "lang": "ja",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

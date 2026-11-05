@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>写真保管庫</title>
+<meta name="description" content="Google ドライブに保管した写真・動画を撮影日順に自分だけで見るアプリ">
+<meta name="theme-color" content="#182642">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="写真保管庫">
+<meta name="referrer" content="no-referrer">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/favicon.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 初回設定（クライアント ID） -->
+<section id="setup" class="screen hidden">
+  <img class="logo" src="icons/icon-192.png" alt="">
+  <h1>写真保管庫 の初回設定</h1>
+  <p>このアプリは、あなたの Google アカウントで作った「OAuth クライアント ID」を使って、あなたの Google ドライブだけにつながります。手順書（セットアップ手順.md）のとおりに作った ID を貼り付けてください。</p>
+  <label>クライアント ID</label>
+  <input id="clientIdInput" placeholder="xxxxxxxx.apps.googleusercontent.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+  <label>Google ドライブ内のフォルダ名（マイドライブ直下）</label>
+  <input id="folderNameInput" value="写真保管庫">
+  <button id="saveSetup" class="primary big">保存して次へ</button>
+  <div class="note">ID は この iPhone（ブラウザ）の中にだけ保存されます。アプリの配信ファイルにあなたの写真や個人情報は含まれません。</div>
+</section>
+
+<!-- ログイン -->
+<section id="login" class="screen hidden">
+  <img class="logo" src="icons/icon-192.png" alt="">
+  <h1>写真保管庫</h1>
+  <p>Google ドライブの「<span class="folderName">写真保管庫</span>」フォルダにある写真・動画を、撮影日の順に表示します。閲覧も削除も、ログインしたあなただけができます。</p>
+  <button id="loginBtn" class="primary big">Google でログイン</button>
+  <p id="loginMsg" class="note hidden"></p>
+  <div class="note">
+    初回は Google から「このアプリは Google で確認されていません」と表示されます。自分専用アプリの正常な表示です。<br>
+    「詳細」→「（安全ではないページ）に移動」→ アクセスを許可、の順に進んでください。
+  </div>
+  <button id="resetSetup" class="ghost" style="margin-top:18px;font-size:13px;color:var(--muted)">クライアント ID を設定し直す</button>
+</section>
+
+<!-- メイン -->
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="row between">
+      <div class="title"><img src="icons/icon-192.png" alt=""><span class="folderName">写真保管庫</span></div>
+      <div class="row">
+        <select id="jump" class="jump" aria-label="年月へ移動"></select>
+        <button id="uploadBtn" class="iconbtn" title="iPhone からアップロード">&#8679;</button>
+        <button id="selectBtn" class="iconbtn" title="選択">&#9745;</button>
+        <button id="menuBtn" class="iconbtn" title="メニュー">&#8942;</button>
+      </div>
+    </div>
+    <div class="chips" id="filters">
+      <button class="chip on" data-f="all">すべて</button>
+      <button class="chip" data-f="photo">写真</button>
+      <button class="chip" data-f="video">動画</button>
+      <button class="chip" data-f="star">&#9733; お気に入り</button>
+      <button class="chip" data-f="nodate">日付なし</button>
+    </div>
+    <div class="quota" id="quota"><span id="quotaText">容量を確認中…</span><div class="bar"><i id="quotaBar" style="width:0"></i></div><span id="countText"></span></div>
+  </header>
+  <div id="banners"></div>
+  <main id="timeline"></main>
+  <input type="file" id="filePicker" accept="image/*,video/*" multiple class="hidden">
+</div>
+
+<!-- 選択モードのバー -->
+<div id="selbar" class="bottombar hidden">
+  <button id="selAll">全部</button>
+  <span class="grow" id="selCount">0 件</span>
+  <button id="selStar">&#9733;</button>
+  <button id="selSave">保存</button>
+  <button id="selDelete" class="danger">削除</button>
+  <button id="selCancel">終了</button>
+</div>
+
+<!-- アップロード進捗 -->
+<div id="upbar" class="bottombar hidden">
+  <div class="grow"><div id="upText">アップロード中…</div><div class="progress"><i id="upProg"></i></div></div>
+  <button id="upCancel">中止</button>
+</div>
+
+<div id="viewerRoot"></div>
+<div id="sheetRoot"></div>
+<div id="toastRoot"></div>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
