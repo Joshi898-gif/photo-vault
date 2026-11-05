@@ -427,7 +427,8 @@ function updateQuota() {
   const pct = Math.min(100, used / limit * 100);
   el.textContent = `Drive 残り ${fmtBytes(Math.max(0, limit - used))} / ${fmtBytes(limit)}`;
   bar.style.width = pct.toFixed(1) + '%'; bar.className = pct >= 97 ? 'full' : pct >= 85 ? 'warn' : '';
-  banner('quota', pct >= 90 ? `Google ドライブの残りが ${fmtBytes(limit - used)} です。15GB を超える場合は Google One（100GB 月250円〜）の追加を検討してください。` : null);
+  const over = used - limit;
+  banner('quota', over > 0 ? `<b>Google の保存容量がいっぱいです</b>（${fmtBytes(over)} 超過）。このままでは写真をアップロードできません。Gmail・Google フォト・Drive の不要なものを消すか、Google One（100GB 月250円〜）を追加してください。` : pct >= 90 ? `Google ドライブの残りが ${fmtBytes(limit - used)} です。15GB を超える場合は Google One（100GB 月250円〜）の追加を検討してください。` : null, over > 0 ? '容量を確認' : undefined, over > 0 ? () => window.open('https://one.google.com/storage', '_blank') : undefined, over > 0);
 }
 function banner(key, html, btnLabel, onClick, red) {
   const root = $('#banners'); let el = root.querySelector(`[data-key="${key}"]`);
