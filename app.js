@@ -87,7 +87,7 @@ function parseHashToken(hash) {
 // iframe の中で開かれたとき（無音の更新）: 親にトークンを渡して終了
 if (window.parent !== window && /access_token=|error=/.test(location.hash)) {
   try { window.parent.postMessage({ type: 'vault-auth', hash: location.hash }, location.origin); } catch {}
-  throw new Error('auth-iframe'); // ここで止める（描画しない）
+  return; // ここで止める（描画しない）
 }
 function handleRedirect() {
   if (!/access_token=|error=/.test(location.hash)) return null;
