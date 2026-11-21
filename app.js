@@ -32,7 +32,10 @@ const state = {
   filter: 'all', order: LS.get('vault_order', 'desc'),
   selecting: false, selected: new Set(),
   view: null, // ビューア状態
-  loading: false
+  loading: false,
+  unlockUntil: 0,            // 削除ロックの一時解除期限（ms）
+  trash: null, trashRaw: [], // Drive のゴミ箱（ゴミ箱タブを開いたときに読む）
+  backup: null               // PC が書く バックアップ状況.json
 };
 
 const fmtBytes = (n) => { n = +n || 0; if (n >= 1e12) return (n / 1e12).toFixed(2) + ' TB'; if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB'; if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB'; if (n >= 1e3) return (n / 1e3).toFixed(0) + ' KB'; return n + ' B'; };
@@ -182,8 +185,22 @@ const realBackend = {
       const ix = await listAll(`name='index.json' and '${state.vaultId}' in parents and trashed=false`, 'files(id,modifiedTime)');
       if (ix.length) index = await gjson(`${API}/files/${ix[0].id}?alt=media`);
     } catch (e) { console.warn('index.json 読めず', e); }
-    return { raw, folders: Array.from(folders.values()), index };
+    // PC が書くバックアップ状況
+    let backup = null;
+    try {
+      const bs = await listAll(`name='バックアップ状況.json' and '${state.vaultId}' in parents and trashed=false`, 'files(id)');
+      if (bs.length) backup = await gjson(`${API}/files/${bs[0].id}?alt=media`);
+    } catch (e) { console.warn('バックアップ状況 読めず', e); }
+    return { raw, folders: Array.from(folders.values()), index, backup };
   },
+  async loadTrash() {
+    const out = [];
+    for (const ids of chunk(Array.from(state.folders.keys()), 25)) {
+      out.push(...await listAll(`trashed=true and (mimeType contains 'image/' or mimeType contains 'video/') and (${ids.map((i) => `'${i}' in parents`).join(' or ')})`, `files(${FILE_FIELDS},trashedTime)`));
+    }
+    return out;
+  },
+  async untrash(ids) { for (const id of ids) await patch(id, { trashed: false }); },
   async refreshThumbLink(item) { const j = await gjson(`${API}/files/${item.id}?fields=thumbnailLink,hasThumbnail`); item.thumb = j.thumbnailLink || ''; return item.thumb; },
   async thumbBlob(item, size) {
     const tryLink = async (link) => {
@@ -273,6 +290,7 @@ function demoBackend() {
     return out;
   };
   let raw = mk(140);
+  let trashRaw = mk(4).map((r, i) => Object.assign(r, { id: 'trash' + i, trashedTime: new Date(Date.now() - i * 86400000 * 5).toISOString() }));
   const paint = (item, size) => new Promise((res) => {
     const c = document.createElement('canvas'); c.width = c.height = Math.min(size, 640); const g = c.getContext('2d');
     const h = item._hue || 0; const gr = g.createLinearGradient(0, 0, c.width, c.height); gr.addColorStop(0, `hsl(${h},55%,55%)`); gr.addColorStop(1, `hsl(${(h + 60) % 360},60%,35%)`); g.fillStyle = gr; g.fillRect(0, 0, c.width, c.height);
@@ -282,10 +300,12 @@ function demoBackend() {
   });
   return {
     async init() { state.email = 'demo@example.com'; state.quota = { limit: String(15e9), usage: String(9.7e9), usageInDrive: String(8e9) }; },
-    async loadAll(onProgress) { await sleep(400); onProgress && onProgress(raw.length, 1, 1); state.vaultId = 'demo-root'; return { raw, folders: [{ id: 'demo-root', name: state.folderName, parent: null }, { id: 'demo-2025', name: '2025', parent: 'demo-root' }], index: null }; },
+    async loadAll(onProgress) { await sleep(400); onProgress && onProgress(raw.length, 1, 1); state.vaultId = 'demo-root'; return { raw: raw.slice(), folders: [{ id: 'demo-root', name: state.folderName, parent: null }, { id: 'demo-2025', name: '2025', parent: 'demo-root' }], index: null, backup: { time: new Date(Date.now() - 20 * 3600000).toISOString(), count: raw.length, bytes: 5.2e9, dests: [{ path: 'C:\\Users\\Owner\\Backup\\写真保管庫', files: raw.length, ok: true }] } }; },
+    async loadTrash() { await sleep(300); return trashRaw.slice(); },
+    async untrash(ids) { await sleep(300); const back = trashRaw.filter((r) => ids.includes(r.id)); trashRaw = trashRaw.filter((r) => !ids.includes(r.id)); back.forEach((r) => { delete r.trashedTime; delete r._trashed; raw.push(r); }); },
     async thumbBlob(item, size) { await sleep(60 + Math.random() * 120); return paint(item, size); },
     async downloadBlob(item) { return paint(item, 1200); },
-    async trash(ids) { await sleep(300); raw = raw.filter((r) => !ids.includes(r.id)); },
+    async trash(ids) { await sleep(300); const gone = raw.filter((r) => ids.includes(r.id)); raw = raw.filter((r) => !ids.includes(r.id)); gone.forEach((r) => { r.trashedTime = new Date().toISOString(); trashRaw.push(r); }); },
     async setStar(ids, on) { await sleep(200); raw.forEach((r) => { if (ids.includes(r.id)) r.starred = on; }); },
     async setCaptured(id, iso) { await sleep(200); const r = raw.find((x) => x.id === id); if (r) { r.modifiedTime = iso; r.appProperties = { captured: iso }; } return r; },
     vaultLink() { return 'https://drive.google.com/'; }, fileLink() { return 'https://drive.google.com/'; }, previewUrl() { return 'about:blank'; },
@@ -311,7 +331,7 @@ function parseExif(s) { // "YYYY:MM:DD HH:MM:SS"（カメラのローカル時�
 function toItem(f) {
   const video = (f.mimeType || '').startsWith('video/'); const im = f.imageMediaMetadata || {}; const vm = f.videoMediaMetadata || {};
   const it = { id: f.id, name: f.name, mime: f.mimeType, size: +f.size || 0, md5: f.md5Checksum || '', created: f.createdTime, modified: f.modifiedTime, parent: (f.parents || [])[0] || state.vaultId,
-    thumb: f.thumbnailLink || '', exif: im.time || '', w: im.width || vm.width || 0, h: im.height || vm.height || 0, dur: +vm.durationMillis || 0, app: f.appProperties || {}, starred: !!f.starred, shared: !!f.shared, link: f.webViewLink || '', video, _hue: f._hue, t: 0, src: '' };
+    thumb: f.thumbnailLink || '', exif: im.time || '', w: im.width || vm.width || 0, h: im.height || vm.height || 0, dur: +vm.durationMillis || 0, app: f.appProperties || {}, starred: !!f.starred, shared: !!f.shared, link: f.webViewLink || '', video, _hue: f._hue, t: 0, src: '', trashed: !!f._trashed || !!f.trashedTime, trashedTime: f.trashedTime || '' };
   resolveDate(it); return it;
 }
 function resolveDate(it) {
@@ -392,6 +412,7 @@ const itemById = (id) => itemMap.get(id);
 
 function visibleItems() {
   const f = state.filter;
+  if (f === 'trash') return state.trash || [];
   return state.items.filter((i) => f === 'all' || (f === 'photo' && !i.video) || (f === 'video' && i.video) || (f === 'star' && i.starred) || (f === 'nodate' && i.estimated));
 }
 function render(keepScroll = true) {
@@ -399,7 +420,7 @@ function render(keepScroll = true) {
   itemMap.clear(); for (const i of state.items) itemMap.set(i.id, i);
   const list = visibleItems(); const tl = $('#timeline'); io.disconnect();
   if (!list.length) {
-    tl.innerHTML = `<div class="empty">${state.items.length ? 'この条件の写真・動画はありません' : `まだ写真がありません。<br>iPhone の Google ドライブ アプリで「${esc(state.folderName)}」フォルダにアップロードするか、<br>右上の &#8679; からアップロードしてください。`}</div>`;
+    tl.innerHTML = state.filter === 'trash' ? '<div class="empty">ゴミ箱は空です</div>' : `<div class="empty">${state.items.length ? 'この条件の写真・動画はありません' : `まだ写真がありません。<br>iPhone の Google ドライブ アプリで「${esc(state.folderName)}」フォルダにアップロードするか、<br>右上の &#8679; からアップロードしてください。`}</div>`;
     $('#jump').innerHTML = ''; updateCount(list); return;
   }
   const groups = []; let cur = null;
@@ -408,7 +429,7 @@ function render(keepScroll = true) {
     const [yy, mm] = g.ym.split('-'); const label = g.ym === '0000-00' ? '日付不明' : `${yy}年${+mm}月`;
     return `<section class="month" id="m-${g.ym}" data-ym="${g.ym}"><h2>${label}<small>${g.items.length} 件</small></h2><div class="grid">${g.items.map(tileHtml).join('')}</div></section>`;
   }).join('');
-  tl.innerHTML = html;
+  tl.innerHTML = (state.filter === 'trash' ? '<div class="tlnote">Google ドライブのゴミ箱にある写真・動画です。<b>30 日たつと Google が完全に削除します。</b>戻したいものはタップ →「元に戻す」、まとめて戻すなら長押しで選択してください。パソコンのバックアップには残っています。</div>' : '') + html;
   $$('.tile', tl).forEach((t) => io.observe(t));
   const jump = $('#jump'); jump.innerHTML = groups.map((g) => { const [yy, mm] = g.ym.split('-'); return `<option value="${g.ym}">${g.ym === '0000-00' ? '日付不明' : `${yy}年${+mm}月`}（${g.items.length}）</option>`; }).join('');
   updateCount(list);
@@ -416,7 +437,7 @@ function render(keepScroll = true) {
   const hh = $('header.top').offsetHeight; $$('.month').forEach((s) => s.style.scrollMarginTop = hh + 'px'); $$('.month h2').forEach((h) => h.style.top = hh + 'px');
 }
 function tileHtml(it) {
-  return `<div class="tile${state.selected.has(it.id) ? ' selected' : ''}" data-id="${it.id}"><img alt="" decoding="async">${it.starred ? '<span class="star">&#9733;</span>' : ''}${it.shared ? '<span class="shared" title="共有されています">&#128279;</span>' : ''}${it.video ? `<span class="badge">&#9654; ${it.dur ? fmtDur(it.dur) : '動画'}</span>` : (it.estimated ? '<span class="badge" title="撮影日は推定">?</span>' : '')}<span class="sel"></span></div>`;
+  return `<div class="tile${state.selected.has(it.id) ? ' selected' : ''}" data-id="${it.id}"><img alt="" decoding="async">${it.starred ? '<span class="star">&#9733;</span>' : ''}${it.shared ? '<span class="shared" title="共有されています">&#128279;</span>' : ''}${it.trashed ? '<span class="badge tb">ゴミ箱</span>' : ''}${it.video ? `<span class="badge">&#9654; ${it.dur ? fmtDur(it.dur) : '動画'}</span>` : (it.estimated ? '<span class="badge" title="撮影日は推定">?</span>' : '')}<span class="sel"></span></div>`;
 }
 function updateCount(list) { const n = list.length; const v = list.filter((i) => i.video).length; $('#countText').textContent = `${n.toLocaleString()} 件${v ? `（動画 ${v}）` : ''}`; }
 function updateQuota() {
@@ -457,16 +478,17 @@ async function boot() {
   if (cached && cached.raw && cached.raw.length) { restoreCache(cached); render(false); }
   await startLoad();
 }
-function restoreCache(c) { state.vaultId = c.vaultId; state.folders = new Map((c.folders || []).map((f) => [f.id, f])); state.raw = c.raw; state.index = c.index || null; state.quota = c.quota || state.quota; state.email = c.email || state.email; rebuildItems(); updateQuota(); }
+function restoreCache(c) { state.vaultId = c.vaultId; state.folders = new Map((c.folders || []).map((f) => [f.id, f])); state.raw = c.raw; state.index = c.index || null; state.quota = c.quota || state.quota; state.email = c.email || state.email; state.backup = c.backup || null; rebuildItems(); updateQuota(); }
 async function startLoad() {
   if (state.loading) return; state.loading = true;
   toast('<span class="spin"></span> 読み込み中…', 0);
   try {
     await drive.init(); updateQuota();
     const res = await drive.loadAll((n) => toast(`<span class="spin"></span> ${n.toLocaleString()} 件 読み込み中…`, 0));
-    state.raw = res.raw; state.folders = new Map(res.folders.map((f) => [f.id, f])); state.index = res.index;
+    state.raw = res.raw; state.folders = new Map(res.folders.map((f) => [f.id, f])); state.index = res.index; state.backup = res.backup || null; state.trash = null;
     rebuildItems(); render(true); toastOff();
-    idb.set('items', { vaultId: state.vaultId, folders: res.folders, raw: res.raw, index: res.index, quota: state.quota, email: state.email, ts: Date.now() });
+    idb.set('items', { vaultId: state.vaultId, folders: res.folders, raw: res.raw, index: res.index, backup: state.backup, quota: state.quota, email: state.email, ts: Date.now() });
+    checkBackupBanner();
     const resume = LS.get('vault_resume', null); if (resume) { LS.del('vault_resume'); setFilter(resume.filter || 'all'); window.scrollTo(0, resume.y || 0); }
     checkSharingBanner();
     if (IS_IOS && !STANDALONE && !LS.get('vault_a2hs_seen', false)) { banner('a2hs', 'Safari の共有ボタン →「ホーム画面に追加」で、アプリとして使えます。', '了解', () => { LS.set('vault_a2hs_seen', true); banner('a2hs', null); }); }
@@ -491,7 +513,53 @@ async function checkSharingBanner() {
 }
 
 // ---------- 操作 ----------
-function setFilter(f) { state.filter = f; $$('#filters .chip').forEach((c) => c.classList.toggle('on', c.dataset.f === f)); render(false); window.scrollTo(0, 0); }
+async function setFilter(f) {
+  state.filter = f; $$('#filters .chip').forEach((c) => c.classList.toggle('on', c.dataset.f === f));
+  if (f === 'trash' && !state.trash) {
+    toast('<span class="spin"></span> ゴミ箱を読み込み中…', 0);
+    try { const raw = await drive.loadTrash(); raw.forEach((r) => r._trashed = true); state.trashRaw = raw; state.trash = raw.map(toItem); state.trash.sort((a, b) => Date.parse(b.trashedTime || 0) - Date.parse(a.trashedTime || 0)); }
+    catch (e) { toast('ゴミ箱を読めません: ' + esc(e.message), 5000); state.trash = []; }
+    toastOff();
+  }
+  if (state.selecting) endSelect();
+  render(false); window.scrollTo(0, 0);
+}
+// 削除ロック: 普段は削除できない。メニューで 10 分だけ解除できる（誤タップ・誤操作からの保護）
+function deleteAllowed() {
+  if (state.unlockUntil > Date.now()) return true;
+  alert('削除ロックが掛かっています。\n\n誤って消さないための保護です。どうしても削除するときは、右上の ⋮ メニュー →「削除ロックを一時解除」を押してください（10 分間だけ削除できます）。');
+  return false;
+}
+let lockTimer = null;
+function updateLockBanner() {
+  const left = state.unlockUntil - Date.now();
+  if (left <= 0) { banner('unlock', null); if (lockTimer) { clearInterval(lockTimer); lockTimer = null; } return; }
+  banner('unlock', `&#128275; <b>削除ロック解除中</b>（あと ${Math.ceil(left / 60000)} 分で自動的にロック）`, 'ロックする', () => { state.unlockUntil = 0; updateLockBanner(); toast('削除ロックを掛けました'); }, true);
+  if (!lockTimer) lockTimer = setInterval(updateLockBanner, 30000);
+}
+// バックアップ状況（PC の backup_photos.ps1 が書く）
+function backupLine() {
+  const b = state.backup; if (!b || !b.time) return 'まだ取られていません（PC が毎日 12:40 に取ります）';
+  const ok = (b.dests || []).filter((d) => d.ok).map((d) => d.path).join('、');
+  return `${fmtDate(Date.parse(b.time))}　${(+b.count || 0).toLocaleString()} 件（${fmtBytes(+b.bytes || 0)}）→ ${esc(ok || '-')}`;
+}
+function checkBackupBanner() {
+  if (!state.items.length) { banner('backup', null); return; }
+  const b = state.backup; const age = b && b.time ? (Date.now() - Date.parse(b.time)) / 86400000 : Infinity;
+  if (age <= 3) { banner('backup', null); return; }
+  banner('backup', b && b.time ? `パソコンのバックアップが <b>${Math.floor(age)} 日前</b>から更新されていません。パソコンを起動しておいてください（毎日 12:40 に自動）。` : 'パソコンのバックアップがまだ取られていません。パソコンを起動しておいてください（毎日 12:40 に自動で取られます）。');
+}
+async function restoreItems(ids) {
+  if (!ids.length) return false;
+  if (!confirm(`${ids.length} 件をゴミ箱から元に戻しますか？`)) return false;
+  toast('<span class="spin"></span> 戻しています…', 0);
+  try {
+    await drive.untrash(ids); const set = new Set(ids);
+    const back = state.trashRaw.filter((r) => set.has(r.id)); back.forEach((r) => { delete r._trashed; delete r.trashedTime; state.raw.push(r); });
+    state.trashRaw = state.trashRaw.filter((r) => !set.has(r.id)); state.trash = (state.trash || []).filter((i) => !set.has(i.id));
+    rebuildItems(); syncRawFlags(); render(); toast(`${ids.length} 件を元に戻しました`); return true;
+  } catch (e) { toast('戻せませんでした: ' + esc(e.message), 5000); return false; }
+}
 $('#filters').addEventListener('click', (e) => { const c = e.target.closest('.chip'); if (c) setFilter(c.dataset.f); });
 $('#jump').addEventListener('change', (e) => { const s = document.getElementById('m-' + e.target.value); if (s) s.scrollIntoView({ block: 'start' }); });
 window.addEventListener('scroll', () => { // スクロール位置に合わせて年月セレクトを追従
@@ -513,24 +581,25 @@ $('#timeline').addEventListener('touchstart', (e) => { const tile = e.target.clo
 // 選択モード
 function startSelect() { state.selecting = true; document.body.classList.add('selecting'); $('#selbar').classList.remove('hidden'); updateSelBar(); }
 function endSelect() { state.selecting = false; state.selected.clear(); document.body.classList.remove('selecting'); $('#selbar').classList.add('hidden'); $$('.tile.selected').forEach((t) => t.classList.remove('selected')); }
-function updateSelBar() { $('#selCount').textContent = `${state.selected.size} 件`; const dis = !state.selected.size; ['#selStar', '#selSave', '#selDelete'].forEach((s) => $(s).disabled = dis); }
+function updateSelBar() { $('#selCount').textContent = `${state.selected.size} 件`; const dis = !state.selected.size; ['#selStar', '#selSave', '#selDelete'].forEach((s) => $(s).disabled = dis); const tr = state.filter === 'trash'; $('#selStar').classList.toggle('hidden', tr); $('#selDelete').textContent = tr ? '元に戻す' : '削除'; $('#selDelete').className = tr ? 'primary' : 'danger'; }
 $('#selectBtn').onclick = () => state.selecting ? endSelect() : startSelect();
 $('#selCancel').onclick = endSelect;
 $('#selAll').onclick = () => { const vis = visibleItems(); const all = vis.every((i) => state.selected.has(i.id)); vis.forEach((i) => all ? state.selected.delete(i.id) : state.selected.add(i.id)); $$('.tile').forEach((t) => t.classList.toggle('selected', state.selected.has(t.dataset.id))); updateSelBar(); };
-$('#selDelete').onclick = () => deleteItems(Array.from(state.selected)).then((ok) => ok && endSelect());
+$('#selDelete').onclick = () => (state.filter === 'trash' ? restoreItems(Array.from(state.selected)) : deleteItems(Array.from(state.selected))).then((ok) => ok && endSelect());
 $('#selStar').onclick = async () => { const ids = Array.from(state.selected); const items = ids.map(itemById).filter(Boolean); const on = !items.every((i) => i.starred); toast('<span class="spin"></span> 更新中…', 0); try { await drive.setStar(ids, on); items.forEach((i) => i.starred = on); syncRawFlags(); render(); toast(on ? '★ お気に入りに追加' : '★ を外しました'); } catch (e) { toast('失敗: ' + esc(e.message), 5000); } };
 $('#selSave').onclick = () => saveItems(Array.from(state.selected).map(itemById).filter(Boolean));
 
-function syncRawFlags() { const m = new Map(state.items.map((i) => [i.id, i])); for (const r of state.raw) { const i = m.get(r.id); if (i) { r.starred = i.starred; r.shared = i.shared; } } idb.set('items', { vaultId: state.vaultId, folders: Array.from(state.folders.values()), raw: state.raw, index: state.index, quota: state.quota, email: state.email, ts: Date.now() }); }
+function syncRawFlags() { const m = new Map(state.items.map((i) => [i.id, i])); for (const r of state.raw) { const i = m.get(r.id); if (i) { r.starred = i.starred; r.shared = i.shared; } } idb.set('items', { vaultId: state.vaultId, folders: Array.from(state.folders.values()), raw: state.raw, index: state.index, backup: state.backup, quota: state.quota, email: state.email, ts: Date.now() }); }
 
 async function deleteItems(ids) {
   if (!ids.length) return false;
+  if (!deleteAllowed()) return false;
   if (!confirm(`${ids.length} 件を Google ドライブのゴミ箱に移動しますか？\n（30 日以内なら Google ドライブのゴミ箱から元に戻せます。パソコンのバックアップには残ります）`)) return false;
   toast('<span class="spin"></span> 削除中…', 0);
   try {
     await drive.trash(ids); const set = new Set(ids);
     state.raw = state.raw.filter((r) => !set.has(r.id)); state.items = state.items.filter((i) => !set.has(i.id));
-    syncRawFlags(); render(); toast(`${ids.length} 件をゴミ箱に移動しました`); return true;
+    state.trash = null; syncRawFlags(); render(); toast(`${ids.length} 件をゴミ箱に移動しました（上の「ゴミ箱」タブから 30 日以内なら戻せます）`, 4000); return true;
   } catch (e) { toast('削除に失敗: ' + esc(e.message), 5000); return false; }
 }
 async function saveItems(items) {
@@ -556,9 +625,10 @@ function sheet(title, buttons, extraHtml = '') {
 }
 $('#menuBtn').onclick = () => {
   const qq = state.quota || {}; const used = +qq.usage || 0, limit = +qq.limit || 0;
-  const info = `<div class="kv">アカウント: ${esc(state.email || '-')}<br>フォルダ: ${esc(state.folderName)}（${state.items.length.toLocaleString()} 件 / 写真 ${state.items.filter((i) => !i.video).length.toLocaleString()}・動画 ${state.items.filter((i) => i.video).length.toLocaleString()}）<br>容量: ${limit ? `${fmtBytes(used)} 使用 / ${fmtBytes(limit)}（残り ${fmtBytes(limit - used)}）` : fmtBytes(used) + ' 使用'}<br>撮影日の索引: ${state.index && state.index.generated ? `PC 作成 ${esc(state.index.generated).slice(0, 16)}（${Object.keys(state.index.files || {}).length.toLocaleString()} 件）` : 'なし（PC の整理ツールが作ります）'}<br>日付が推定のもの: ${state.items.filter((i) => i.estimated).length.toLocaleString()} 件 ・ バージョン ${esc(CFG.version)}</div>`;
+  const info = `<div class="kv">アカウント: ${esc(state.email || '-')}<br>フォルダ: ${esc(state.folderName)}（${state.items.length.toLocaleString()} 件 / 写真 ${state.items.filter((i) => !i.video).length.toLocaleString()}・動画 ${state.items.filter((i) => i.video).length.toLocaleString()}）<br>容量: ${limit ? `${fmtBytes(used)} 使用 / ${fmtBytes(limit)}（残り ${fmtBytes(limit - used)}）` : fmtBytes(used) + ' 使用'}<br>撮影日の索引: ${state.index && state.index.generated ? `PC 作成 ${esc(state.index.generated).slice(0, 16)}（${Object.keys(state.index.files || {}).length.toLocaleString()} 件）` : 'なし（PC の整理ツールが作ります）'}<br>日付が推定のもの: ${state.items.filter((i) => i.estimated).length.toLocaleString()} 件<br>PC のバックアップ: ${backupLine()}<br>削除ロック: ${state.unlockUntil > Date.now() ? '解除中' : '掛かっています'} ・ バージョン ${esc(CFG.version)}</div>`;
   sheet('メニュー', [
     { label: '&#8635; 最新の状態に更新', fn: () => startLoad() },
+    { label: state.unlockUntil > Date.now() ? '&#128274; 削除ロックを掛ける' : '&#128275; 削除ロックを一時解除（10 分だけ削除できる）', fn: () => { if (state.unlockUntil > Date.now()) { state.unlockUntil = 0; updateLockBanner(); toast('削除ロックを掛けました'); return; } if (!confirm('10 分間だけ、写真をゴミ箱に移せるようになります。\n（ゴミ箱からは 30 日以内なら戻せます。パソコンのバックアップは消えません）\n解除しますか？')) return; state.unlockUntil = Date.now() + 10 * 60000; updateLockBanner(); toast('10 分間だけ削除できます'); } },
     { label: '&#128737; 共有チェック（私だけか確認）', fn: async () => { toast('<span class="spin"></span> 確認中…', 0); try { const r = await drive.checkSharing(); const n = r.folderPerms.length + r.sharedItems.length; toastOff(); if (!n) alert('共有はありません。あなただけがアクセスできる状態です。'); else { await checkSharingBanner(); window.scrollTo(0, 0); } } catch (e) { toast('確認に失敗: ' + esc(e.message), 5000); } } },
     { label: `&#8645; 並び順: ${state.order === 'desc' ? '新しい順 → 古い順にする' : '古い順 → 新しい順にする'}`, fn: () => { state.order = state.order === 'desc' ? 'asc' : 'desc'; LS.set('vault_order', state.order); sortItems(); render(false); window.scrollTo(0, 0); } },
     { label: '&#128193; Google ドライブでフォルダを開く', fn: () => window.open(drive.vaultLink(), '_blank') },
@@ -582,7 +652,7 @@ function openViewer(list, idx) {
   $('#vOpen').onclick = () => window.open(drive.fileLink(curItem()), '_blank');
   $('#vStar').onclick = async () => { const it = curItem(); try { await drive.setStar([it.id], !it.starred); it.starred = !it.starred; syncRawFlags(); updateViewerChrome(); $$(`.tile[data-id="${it.id}"]`).forEach((t) => { t.outerHTML = tileHtml(it); }); $$(`.tile[data-id="${it.id}"]`).forEach((t) => io.observe(t)); toast(it.starred ? '★ お気に入りに追加' : '★ を外しました', 1500); } catch (e) { toast('失敗: ' + esc(e.message), 4000); } };
   $('#vSave').onclick = () => saveItems([curItem()]);
-  $('#vDel').onclick = async () => { const it = curItem(); const ok = await deleteItems([it.id]); if (!ok) return; state.view.list = state.view.list.filter((i) => i.id !== it.id); if (!state.view.list.length) return closeViewer(); state.view.idx = Math.min(state.view.idx, state.view.list.length - 1); showCurrent(); };
+  $('#vDel').onclick = async () => { const it = curItem(); const ok = it.trashed ? await restoreItems([it.id]) : await deleteItems([it.id]); if (!ok) return; state.view.list = state.view.list.filter((i) => i.id !== it.id); if (!state.view.list.length) return closeViewer(); state.view.idx = Math.min(state.view.idx, state.view.list.length - 1); showCurrent(); };
   $('#vInfo').onclick = () => {
     const it = curItem(); const srcLabel = { app: 'アプリで設定', index: 'PC の索引（EXIF/動画の作成日時）', exif: '写真の EXIF', modified: '更新日時（推定）', created: 'アップロード日時（推定）' }[it.src] || it.src;
     sheet('情報', [
@@ -622,7 +692,7 @@ function closeViewer(pop = true) {
   if (pop && history.state && history.state.viewer) history.back();
 }
 function releaseViewerUrls() { const v = state.view; if (!v) return; for (const k of ['url', 'bigUrl', 'videoUrl']) if (v[k]) { try { URL.revokeObjectURL(v[k]); } catch {} v[k] = null; } }
-function updateViewerChrome() { const it = curItem(); $('#vDate').textContent = isNaN(it.t) ? '日付不明' : fmtDate(it.t) + (it.estimated ? '（推定）' : ''); $('#vName').textContent = it.name + (it.dur ? `　${fmtDur(it.dur)}` : '') + `　${fmtBytes(it.size)}`; $('#vStar').innerHTML = `<i>${it.starred ? '&#9733;' : '&#9734;'}</i>お気に入り`; }
+function updateViewerChrome() { const it = curItem(); $('#vDate').textContent = isNaN(it.t) ? '日付不明' : fmtDate(it.t) + (it.estimated ? '（推定）' : ''); $('#vName').textContent = it.name + (it.dur ? `　${fmtDur(it.dur)}` : '') + `　${fmtBytes(it.size)}`; $('#vStar').innerHTML = `<i>${it.starred ? '&#9733;' : '&#9734;'}</i>お気に入り`; $('#vStar').disabled = !!it.trashed; $('#vDel').innerHTML = it.trashed ? '<i>&#8634;</i>元に戻す' : '<i>&#128465;</i>削除'; }
 async function showCurrent() {
   const it = curItem(); const stage = $('#vStage'); const v = state.view; releaseViewerUrls(); updateViewerChrome();
   stage.innerHTML = `<div class="loading"><span class="spin"></span> 読み込み中…</div>`;

@@ -56,6 +56,8 @@ body.selecting .tile .sel { display: block; }
 .tile.selected { outline: 3px solid var(--accent); outline-offset: -3px; }
 .tile.selected .sel { background: var(--accent); }
 .tile.selected .sel::after { content: "\2713"; color: #fff; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: center; height: 100%; }
+.tlnote { padding: 10px 14px 2px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+.tile .badge.tb { bottom: auto; top: 4px; background: rgba(229,72,77,.85); }
 .empty { text-align: center; color: var(--muted); padding: 60px 20px; line-height: 1.8; }
 
 /* 画面（ログイン等） */

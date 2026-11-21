@@ -5,5 +5,5 @@ window.VAULT_CONFIG = {
   clientId: "298756894067-mluce0oc1gjfufivbe68e6foml829j48.apps.googleusercontent.com",
   vaultFolderName: "写真保管庫",   // Google ドライブ（マイドライブ直下）のフォルダ名
   appName: "写真保管庫",
-  version: "1.0.0"
+  version: "1.1.0"
 };
