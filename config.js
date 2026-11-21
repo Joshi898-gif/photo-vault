@@ -3,7 +3,7 @@
 //           空のままでも、アプリの初回画面で入力して iPhone 内に保存できます。
 window.VAULT_CONFIG = {
   clientId: "298756894067-mluce0oc1gjfufivbe68e6foml829j48.apps.googleusercontent.com",
-  vaultFolderName: "写真保管庫",   // Google ドライブ（マイドライブ直下）のフォルダ名
+  vaultPath: "Gin/写真保管庫",    // 写真の置き場所（マイドライブからの場所。/ で区切る）
   appName: "写真保管庫",
-  version: "1.1.0"
+  version: "1.2.0"
 };

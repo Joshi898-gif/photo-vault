@@ -6,7 +6,7 @@
 'use strict';
 
 // ---------- 基本 ----------
-const CFG = Object.assign({ clientId: '', vaultFolderName: '写真保管庫', appName: '写真保管庫', version: '1.0.0' }, window.VAULT_CONFIG || {});
+const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.0.0' }, window.VAULT_CONFIG || {});
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const LS = {
@@ -24,7 +24,8 @@ const STANDALONE = window.matchMedia('(display-mode: standalone)').matches || na
 
 const state = {
   clientId: LS.get('vault_client_id', '') || CFG.clientId,
-  folderName: LS.get('vault_folder_name', '') || CFG.vaultFolderName,
+  folderPath: LS.get('vault_folder_path', '') || CFG.vaultPath,   // 例 Gin/写真保管庫（以前の vault_folder_name は使わない）
+  folderName: '',
   token: null, tokenExp: 0,
   email: '', quota: null,
   vaultId: null, folders: new Map(), // id -> {id,name,parent}
@@ -58,14 +59,15 @@ const idb = {
   open() {
     if (this.db) return Promise.resolve(this.db);
     return new Promise((res, rej) => {
-      const r = indexedDB.open('vault-db', 1);
+      const r = indexedDB.open('vault-db-2', 1);
       r.onupgradeneeded = () => r.result.createObjectStore('kv');
       r.onsuccess = () => { this.db = r.result; res(this.db); };
       r.onerror = () => rej(r.error);
     });
   },
-  async get(k) { try { const db = await this.open(); return await new Promise((res, rej) => { const t = db.transaction('kv').objectStore('kv').get(k); t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error); }); } catch { return undefined; } },
-  async set(k, v) { try { const db = await this.open(); await new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite').objectStore('kv').put(v, k); t.onsuccess = res; t.onerror = () => rej(t.error); }); } catch {} },
+  async get(k) { if (DEMO) return undefined; try { const db = await this.open(); return await new Promise((res, rej) => { const t = db.transaction('kv').objectStore('kv').get(k); t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error); }); } catch { return undefined; } },
+  async set(k, v) { if (DEMO) return; try { // デモの見本データを本物の一覧キャッシュに混ぜない
+    const db = await this.open(); await new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite').objectStore('kv').put(v, k); t.onsuccess = res; t.onerror = () => rej(t.error); }); } catch {} },
   async del(k) { try { const db = await this.open(); await new Promise((res) => { const t = db.transaction('kv', 'readwrite').objectStore('kv').delete(k); t.onsuccess = res; t.onerror = res; }); } catch {} }
 };
 
@@ -152,12 +154,32 @@ const realBackend = {
     state.quota = j.storageQuota || null;
   },
   async findVault(create) {
-    const name = state.folderName;
-    const fs = await listAll(`name='${q(name)}' and mimeType='application/vnd.google-apps.folder' and 'root' in parents and trashed=false`, 'files(id,name)');
-    if (fs.length) return fs[0].id;
-    if (!create) return null;
-    const j = await gjson(`${API}/files?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: ['root'] }) });
-    return j.id;
+    // 「Gin/写真保管庫」のような場所を、マイドライブから順にたどる
+    const parts = state.folderPath.split('/').map((x) => x.trim()).filter(Boolean);
+    const folderQ = (name, parent) => listAll(`name='${q(name)}' and mimeType='application/vnd.google-apps.folder' and '${parent}' in parents and trashed=false`, 'files(id,name,createdTime)');
+    let parent = 'root';
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i]; const last = i === parts.length - 1;
+      let fs = await folderQ(name, parent);
+      if (!fs.length) { await sleep(1500); fs = await folderQ(name, parent); } // 反映待ちで二重に作らないよう、もう一度だけ探す
+      if (fs.length > 1) {
+        // 同じ名前が複数あるときは、パソコンが管理ファイルを置いている方（＝同期している本物）を選ぶ
+        const scored = [];
+        for (const f of fs) {
+          let n = 0;
+          if (last) { try { n = (await listAll(`'${f.id}' in parents and trashed=false and (name='index.json' or name='このフォルダについて.txt' or name='バックアップ状況.json')`, 'files(id)')).length; } catch {} }
+          scored.push({ f, n });
+        }
+        scored.sort((a, b) => (b.n - a.n) || (Date.parse(a.f.createdTime) - Date.parse(b.f.createdTime)));
+        banner('dupvault', `Google ドライブに「${esc(name)}」フォルダが ${fs.length} 個あります。パソコンと同期している方を使っています。もう一方は空なら Drive で削除してかまいません。`);
+        parent = scored[0].f.id; continue;
+      }
+      if (fs.length) { parent = fs[0].id; continue; }
+      if (!create || !last) throw new Error(`Google ドライブに「${parts.slice(0, i + 1).join(' › ')}」が見つかりません。パソコンの Google ドライブが同期しているか確認してください。`);
+      const j = await gjson(`${API}/files?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parent] }) });
+      parent = j.id;
+    }
+    return parent;
   },
   async loadAll(onProgress) {
     if (!state.vaultId) state.vaultId = await this.findVault(true);
@@ -391,7 +413,8 @@ async function trimThumbCache(c) { if (++trimTick % 200) return; try { const key
 
 // ---------- 画面切替 ----------
 function show(id) { for (const s of ['setup', 'login', 'app']) $('#' + s).classList.toggle('hidden', s !== id); }
-function applyFolderName() { $$('.folderName').forEach((e) => e.textContent = state.folderName); document.title = state.folderName; }
+function pathLabel() { return state.folderPath.split('/').filter(Boolean).join(' › '); }
+function applyFolderName() { state.folderName = state.folderPath.split('/').filter(Boolean).pop() || '写真保管庫'; $$('.folderName').forEach((e) => e.textContent = state.folderName); $$('.folderPath').forEach((e) => e.textContent = pathLabel()); document.title = state.folderName; }
 
 // ---------- タイムライン描画 ----------
 const io = new IntersectionObserver((entries) => {
@@ -420,7 +443,7 @@ function render(keepScroll = true) {
   itemMap.clear(); for (const i of state.items) itemMap.set(i.id, i);
   const list = visibleItems(); const tl = $('#timeline'); io.disconnect();
   if (!list.length) {
-    tl.innerHTML = state.filter === 'trash' ? '<div class="empty">ゴミ箱は空です</div>' : `<div class="empty">${state.items.length ? 'この条件の写真・動画はありません' : `まだ写真がありません。<br>iPhone の Google ドライブ アプリで「${esc(state.folderName)}」フォルダにアップロードするか、<br>右上の &#8679; からアップロードしてください。`}</div>`;
+    tl.innerHTML = state.filter === 'trash' ? '<div class="empty">ゴミ箱は空です</div>' : `<div class="empty">${state.items.length ? 'この条件の写真・動画はありません' : `まだ写真がありません。<br>iPhone の Google ドライブ アプリで「${esc(pathLabel())}」フォルダにアップロードするか、<br>右上の &#8679; からアップロードしてください。`}</div>`;
     $('#jump').innerHTML = ''; updateCount(list); return;
   }
   const groups = []; let cur = null;
@@ -625,7 +648,7 @@ function sheet(title, buttons, extraHtml = '') {
 }
 $('#menuBtn').onclick = () => {
   const qq = state.quota || {}; const used = +qq.usage || 0, limit = +qq.limit || 0;
-  const info = `<div class="kv">アカウント: ${esc(state.email || '-')}<br>フォルダ: ${esc(state.folderName)}（${state.items.length.toLocaleString()} 件 / 写真 ${state.items.filter((i) => !i.video).length.toLocaleString()}・動画 ${state.items.filter((i) => i.video).length.toLocaleString()}）<br>容量: ${limit ? `${fmtBytes(used)} 使用 / ${fmtBytes(limit)}（残り ${fmtBytes(limit - used)}）` : fmtBytes(used) + ' 使用'}<br>撮影日の索引: ${state.index && state.index.generated ? `PC 作成 ${esc(state.index.generated).slice(0, 16)}（${Object.keys(state.index.files || {}).length.toLocaleString()} 件）` : 'なし（PC の整理ツールが作ります）'}<br>日付が推定のもの: ${state.items.filter((i) => i.estimated).length.toLocaleString()} 件<br>PC のバックアップ: ${backupLine()}<br>削除ロック: ${state.unlockUntil > Date.now() ? '解除中' : '掛かっています'} ・ バージョン ${esc(CFG.version)}</div>`;
+  const info = `<div class="kv">アカウント: ${esc(state.email || '-')}<br>フォルダ: ${esc(pathLabel())}（${state.items.length.toLocaleString()} 件 / 写真 ${state.items.filter((i) => !i.video).length.toLocaleString()}・動画 ${state.items.filter((i) => i.video).length.toLocaleString()}）<br>容量: ${limit ? `${fmtBytes(used)} 使用 / ${fmtBytes(limit)}（残り ${fmtBytes(limit - used)}）` : fmtBytes(used) + ' 使用'}<br>撮影日の索引: ${state.index && state.index.generated ? `PC 作成 ${esc(state.index.generated).slice(0, 16)}（${Object.keys(state.index.files || {}).length.toLocaleString()} 件）` : 'なし（PC の整理ツールが作ります）'}<br>日付が推定のもの: ${state.items.filter((i) => i.estimated).length.toLocaleString()} 件<br>PC のバックアップ: ${backupLine()}<br>削除ロック: ${state.unlockUntil > Date.now() ? '解除中' : '掛かっています'} ・ バージョン ${esc(CFG.version)}</div>`;
   sheet('メニュー', [
     { label: '&#8635; 最新の状態に更新', fn: () => startLoad() },
     { label: state.unlockUntil > Date.now() ? '&#128274; 削除ロックを掛ける' : '&#128275; 削除ロックを一時解除（10 分だけ削除できる）', fn: () => { if (state.unlockUntil > Date.now()) { state.unlockUntil = 0; updateLockBanner(); toast('削除ロックを掛けました'); return; } if (!confirm('10 分間だけ、写真をゴミ箱に移せるようになります。\n（ゴミ箱からは 30 日以内なら戻せます。パソコンのバックアップは消えません）\n解除しますか？')) return; state.unlockUntil = Date.now() + 10 * 60000; updateLockBanner(); toast('10 分間だけ削除できます'); } },
@@ -776,13 +799,13 @@ async function uploadFiles(files) {
 
 // ---------- 初回設定・ログイン画面 ----------
 $('#saveSetup').onclick = () => {
-  const id = $('#clientIdInput').value.trim(); const fn = $('#folderNameInput').value.trim() || CFG.vaultFolderName;
+  const id = $('#clientIdInput').value.trim(); const fn = $('#folderNameInput').value.trim().replace(/\\/g, '/') || CFG.vaultPath;
   if (!/\.apps\.googleusercontent\.com$/.test(id)) { alert('クライアント ID は「…….apps.googleusercontent.com」の形です。もう一度確認してください。'); return; }
-  LS.set('vault_client_id', id); LS.set('vault_folder_name', fn); state.clientId = id; state.folderName = fn; applyFolderName(); show('login');
+  LS.set('vault_client_id', id); LS.set('vault_folder_path', fn); state.clientId = id; state.folderPath = fn; applyFolderName(); show('login');
 };
 $('#loginBtn').onclick = () => { LS.del('vault_resume'); location.assign(authUrl()); };
 $('#resetSetup').onclick = () => { LS.del('vault_client_id'); clearToken(); state.clientId = ''; $('#clientIdInput').value = ''; show('setup'); };
-if (state.clientId) $('#clientIdInput').value = state.clientId; $('#folderNameInput').value = state.folderName;
+if (state.clientId) $('#clientIdInput').value = state.clientId; $('#folderNameInput').value = state.folderPath;
 
 // 画面復帰時にトークン切れなら静かに更新
 document.addEventListener('visibilitychange', () => { if (!document.hidden && !DEMO && state.token && state.tokenExp < Date.now() + 60000) silentAuth(); });

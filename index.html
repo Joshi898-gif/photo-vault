@@ -25,8 +25,8 @@
   <p>このアプリは、あなたの Google アカウントで作った「OAuth クライアント ID」を使って、あなたの Google ドライブだけにつながります。手順書（セットアップ手順.md）のとおりに作った ID を貼り付けてください。</p>
   <label>クライアント ID</label>
   <input id="clientIdInput" placeholder="xxxxxxxx.apps.googleusercontent.com" autocapitalize="off" autocorrect="off" spellcheck="false">
-  <label>Google ドライブ内のフォルダ名（マイドライブ直下）</label>
-  <input id="folderNameInput" value="写真保管庫">
+  <label>写真の置き場所（マイドライブからの場所。/ で区切る）</label>
+  <input id="folderNameInput" value="Gin/写真保管庫">
   <button id="saveSetup" class="primary big">保存して次へ</button>
   <div class="note">ID は この iPhone（ブラウザ）の中にだけ保存されます。アプリの配信ファイルにあなたの写真や個人情報は含まれません。</div>
 </section>
@@ -35,7 +35,7 @@
 <section id="login" class="screen hidden">
   <img class="logo" src="icons/icon-192.png" alt="">
   <h1>写真保管庫</h1>
-  <p>Google ドライブの「<span class="folderName">写真保管庫</span>」フォルダにある写真・動画を、撮影日の順に表示します。閲覧も削除も、ログインしたあなただけができます。</p>
+  <p>Google ドライブの「<span class="folderPath">Gin › 写真保管庫</span>」フォルダにある写真・動画を、撮影日の順に表示します。閲覧も削除も、ログインしたあなただけができます。</p>
   <button id="loginBtn" class="primary big">Google でログイン</button>
   <p id="loginMsg" class="note hidden"></p>
   <div class="note">
