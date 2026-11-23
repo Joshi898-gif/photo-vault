@@ -6,7 +6,7 @@
 'use strict';
 
 // ---------- 基本 ----------
-const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.0' }, window.VAULT_CONFIG || {});
+const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.1' }, window.VAULT_CONFIG || {});
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const LS = {
@@ -511,6 +511,12 @@ async function startLoad() {
     checkBackupBanner();
     const resume = LS.get('vault_resume', null); if (resume) { LS.del('vault_resume'); setFilter(resume.filter || 'all'); window.scrollTo(0, resume.y || 0); }
     checkSharingBanner();
+    const prevRun = LS.get(UPRUN_KEY, null);
+    if (prevRun && !upState.running) {
+      ulog('interrupted', { since: new Date(prevRun.t).toISOString(), n: prevRun.n }); LS.del(UPRUN_KEY);
+      banner('upstop', `<b>前回のアップロードが途中で止まりました</b>（${new Date(prevRun.t).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} 開始・${prevRun.n} 件）。送り終わった写真は保管されています。同じ写真をもう一度まとめて選べば、まだの分だけ送ります。`, null, null, true);
+      saveUploadLog();
+    }
     if (IS_IOS && !STANDALONE && !LS.get('vault_a2hs_seen', false)) { banner('a2hs', 'Safari の共有ボタン →「ホーム画面に追加」で、アプリとして使えます。', '了解', () => { LS.set('vault_a2hs_seen', true); banner('a2hs', null); }); }
   } catch (e) {
     console.error(e); if (String(e.message).includes('redirecting')) return;
@@ -649,6 +655,7 @@ $('#menuBtn').onclick = () => {
   sheet('メニュー', [
     { label: '&#8635; 最新の状態に更新', fn: () => startLoad() },
     { label: state.unlockUntil > Date.now() ? '&#128274; 削除ロックを掛ける' : '&#128275; 削除ロックを一時解除（10 分だけ削除できる）', fn: () => { if (state.unlockUntil > Date.now()) { state.unlockUntil = 0; updateLockBanner(); toast('削除ロックを掛けました'); return; } if (!confirm('10 分間だけ、写真をゴミ箱に移せるようになります。\n（ゴミ箱からは 30 日以内なら戻せます。パソコンのバックアップは消えません）\n解除しますか？')) return; state.unlockUntil = Date.now() + 10 * 60000; updateLockBanner(); toast('10 分間だけ削除できます'); } },
+    { label: '&#128221; アップロードの記録を保存（不具合の調査用）', fn: async () => { toast('<span class="spin"></span> 保存中…', 0); const ok = await saveUploadLog(); toast(ok ? 'Drive の写真保管庫に「アップロード記録.json」を保存しました' : (DEMO ? 'デモでは保存しません' : '保存できませんでした（ログインし直してから試してください）'), 4000); } },
     { label: '&#128737; 共有チェック（私だけか確認）', fn: async () => { toast('<span class="spin"></span> 確認中…', 0); try { const r = await drive.checkSharing(); const n = r.folderPerms.length + r.sharedItems.length; toastOff(); if (!n) alert('共有はありません。あなただけがアクセスできる状態です。'); else { await checkSharingBanner(); window.scrollTo(0, 0); } } catch (e) { toast('確認に失敗: ' + esc(e.message), 5000); } } },
     { label: `&#8645; 並び順: ${state.order === 'desc' ? '新しい順 → 古い順にする' : '古い順 → 新しい順にする'}`, fn: () => { state.order = state.order === 'desc' ? 'asc' : 'desc'; LS.set('vault_order', state.order); sortItems(); render(false); window.scrollTo(0, 0); } },
     { label: '&#128193; Google ドライブでフォルダを開く', fn: () => window.open(drive.vaultLink(), '_blank') },
@@ -751,6 +758,35 @@ async function fixDate(it) {
 const UP_CONCURRENCY = 3, PREP_CONCURRENCY = 4, CHUNK = 8 * 1024 * 1024; // CHUNK は 256KB の倍数
 const upCtl = { cancelled: false, xhrs: new Set() };
 const upState = { running: false, failed: [] };
+// ---- アップロードの記録（不具合の調査用）: iPhone の中と、Drive の「アップロード記録.json」に残す ----
+const UPLOG_KEY = DEMO ? 'demo_uplog' : 'vault_uplog', UPRUN_KEY = DEMO ? 'demo_uprun' : 'vault_uprun'; // デモは本物の記録と混ぜない
+const upLog = LS.get(UPLOG_KEY, []);
+function ulog(ev, data) {
+  upLog.push(Object.assign({ t: new Date().toISOString(), ev }, data || {}));
+  while (upLog.length > 600) upLog.shift();
+  LS.set(UPLOG_KEY, upLog);
+}
+async function saveUploadLog() {
+  if (DEMO || !state.vaultId || !state.token || state.tokenExp < Date.now() + 60000) return false;
+  const prev = state.noRedirect; state.noRedirect = true;
+  try {
+    const body = JSON.stringify({ saved: new Date().toISOString(), version: CFG.version, ua: navigator.userAgent, standalone: STANDALONE, log: upLog }, null, 1);
+    const ex = await listAll(`name='アップロード記録.json' and '${state.vaultId}' in parents and trashed=false`, 'files(id)');
+    if (ex.length) {
+      await gfetch(`${UPLOAD_API}/${ex[0].id}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body });
+    } else {
+      const b = 'vaultlog' + Date.now();
+      const meta = { name: 'アップロード記録.json', parents: [state.vaultId], mimeType: 'application/json' };
+      const mp = `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${b}--`;
+      await gfetch(`${UPLOAD_API}?uploadType=multipart`, { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${b}` }, body: mp });
+    }
+    return true;
+  } catch (e) { console.warn('記録の保存に失敗', e); return false; }
+  finally { state.noRedirect = prev; }
+}
+window.addEventListener('error', (e) => { if (upState.running) ulog('jserror', { msg: String(e.message).slice(0, 200), at: `${e.lineno}:${e.colno}` }); });
+window.addEventListener('unhandledrejection', (e) => { if (upState.running) ulog('rejection', { msg: String(e.reason && e.reason.message || e.reason).slice(0, 200) }); });
+document.addEventListener('visibilitychange', () => { if (upState.running) ulog(document.hidden ? 'hidden' : 'visible'); });
 let wakeLock = null;
 async function keepAwake(on) {
   try {
@@ -770,7 +806,7 @@ $('#uploadBtn').onclick = () => {
   }
   $('#filePicker').click();
 };
-$('#filePicker').addEventListener('change', async (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
+$('#filePicker').addEventListener('change', async (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; ulog('pick', { n: files.length, mb: Math.round(files.reduce((a, f) => a + f.size, 0) / 1e6), types: [...new Set(files.map((f) => f.type || '?'))].slice(0, 5), tokenMin: Math.round((state.tokenExp - Date.now()) / 60000) }); if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
 $('#upCancel').onclick = () => { if (!confirm('アップロードを中止しますか？（送り終わった写真は残ります）')) return; upCtl.cancelled = true; for (const x of upCtl.xhrs) { try { x.abort(); } catch {} } };
 
 function xhrPut(url, headers, body, onProgress, ctl) {
@@ -805,6 +841,7 @@ async function putResumable(loc, file, onProgress, ctl) {
     if (r && (r.status === 404 || r.status === 410)) throw new Error('アップロードの受付が切れました');
     if (r && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) throw new Error(`アップロード失敗 (${r.status})`);
     // 通信エラー・時間切れ・混雑（5xx/429）: 少し待って、届いた位置を聞いてから続ける
+    ulog('retry', { name: file.name, status: r ? r.status : 0, at: start, fails: fails + 1, online: navigator.onLine, hidden: document.hidden });
     if (++fails > 10) throw new Error(r ? `アップロード失敗 (${r.status})` : '通信エラーが続きました');
     await waitOnline(); await sleep(Math.min(30000, 800 * 2 ** fails));
     try {
@@ -854,6 +891,8 @@ async function uploadFiles(files) {
   const jobs = todo.map((f) => ({ f, loc: null, sent: 0, status: 'wait', err: '' }));
   const total = todo.reduce((sum, f) => sum + f.size, 0) || 1; const t0 = Date.now();
   upState.running = true; upState.failed = []; upCtl.cancelled = false; upCtl.xhrs = new Set(); state.noRedirect = true;
+  ulog('start', { n: jobs.length, skipped, mb: Math.round(total / 1e6), tokenMin: Math.round((state.tokenExp - Date.now()) / 60000), wake: 'wakeLock' in navigator });
+  LS.set(UPRUN_KEY, { t: Date.now(), n: jobs.length });
   banner('upfail', null); keepAwake(true); $('#upbar').classList.remove('hidden'); $('#upProg').style.width = '0';
   const count = (st) => jobs.filter((j) => j.status === st).length;
   let lastPaint = 0;
@@ -879,6 +918,7 @@ async function uploadFiles(files) {
     } catch (e) { j.status = 'fail'; j.err = e.message; }
     prepared++; $('#upText').textContent = `準備中 ${prepared}/${jobs.length} 件…`;
   });
+  ulog('prepared', { ok: jobs.filter((j) => j.loc).length, fail: count('fail'), errs: [...new Set(jobs.filter((j) => j.err).map((j) => j.err))].slice(0, 3), sec: Math.round((Date.now() - t0) / 1000) });
   // 2) 送信: 3 件ずつ。通信が切れても自動で続きから
   await runPool(jobs.filter((j) => j.loc), UP_CONCURRENCY, async (j) => {
     if (upCtl.cancelled) return;
@@ -887,11 +927,14 @@ async function uploadFiles(files) {
       const res = await drive.uploadSession(j.loc, j.f, (b) => { j.sent = b; paint(); }, upCtl);
       j.status = 'ok'; j.sent = j.f.size;
       if (res && res.id) { state.raw.push(res); state.items.push(toItem(res)); }
-    } catch (e) { j.status = e.message === 'cancelled' ? 'cancel' : 'fail'; j.err = e.message; }
+    } catch (e) { j.status = e.message === 'cancelled' ? 'cancel' : 'fail'; j.err = e.message; if (j.status === 'fail') ulog('fail', { name: j.f.name, size: j.f.size, err: e.message }); }
+    if (j.status === 'ok' && count('ok') % 25 === 0) ulog('progress', { ok: count('ok'), of: jobs.length, sec: Math.round((Date.now() - t0) / 1000) });
     paint(true);
   });
   // 3) 後片付けと結果
   upState.running = false; state.noRedirect = false; keepAwake(false);
+  ulog('end', { ok: count('ok'), fail: count('fail'), cancelled: upCtl.cancelled, sec: Math.round((Date.now() - t0) / 1000) }); LS.del(UPRUN_KEY);
+  saveUploadLog();
   $('#upbar').classList.add('hidden'); $('#upProg').style.width = '0';
   sortItems(); syncRawFlags(); render(false);
   const ok = count('ok'); const failed = jobs.filter((j) => j.status === 'fail' || (upCtl.cancelled && j.status !== 'ok'));
