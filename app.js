@@ -6,7 +6,7 @@
 'use strict';
 
 // ---------- 基本 ----------
-const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.0.0' }, window.VAULT_CONFIG || {});
+const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.0' }, window.VAULT_CONFIG || {});
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const LS = {
@@ -115,6 +115,8 @@ function silentAuth() {
 async function ensureToken() {
   if (state.token && state.tokenExp > Date.now() + 30000) return true;
   if (await silentAuth()) return true;
+  // アップロード中に画面ごと Google へ移ると、選んだ写真が消えてしまう。移動せずにエラーにする
+  if (state.noRedirect) throw new Error('ログインの期限が切れました');
   // 画面ごと Google へ（戻ってくると続きから）
   LS.set('vault_resume', { y: window.scrollY, filter: state.filter });
   location.assign(authUrl());
@@ -267,29 +269,15 @@ const realBackend = {
     if (!id) { const j = await gjson(`${API}/files?fields=id`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }) }); id = j.id; }
     state.folders.set(id, { id, name, parent: parentId }); return id;
   },
-  async upload(file, meta, onProgress, ctl) {
-    await ensureToken();
+  async initUpload(file, meta) {
+    // 受付（resumable セッション）を取る。受付 URL は 1 週間有効で、送信そのものにはログインが要らない
     const init = await gfetch(`${UPLOAD_API}?uploadType=resumable&fields=${encodeURIComponent(FILE_FIELDS)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': file.type || 'application/octet-stream', 'X-Upload-Content-Length': String(file.size) }, body: JSON.stringify(meta)
     });
-    const loc = init.headers.get('Location'); if (!loc) throw new Error('アップロード URL が取れませんでした');
-    const CH = 16 * 1024 * 1024; let start = 0; let result = null;
-    while (start < file.size || file.size === 0) {
-      if (ctl.cancelled) throw new Error('cancelled');
-      const end = Math.min(file.size, start + CH);
-      const r = await new Promise((resolve, reject) => {
-        const x = new XMLHttpRequest(); x.open('PUT', loc);
-        x.setRequestHeader('Content-Range', file.size ? `bytes ${start}-${end - 1}/${file.size}` : `bytes */0`);
-        x.upload.onprogress = (e) => onProgress && onProgress(start + e.loaded);
-        x.onload = () => resolve(x); x.onerror = () => reject(new Error('通信エラー')); x.onabort = () => reject(new Error('cancelled'));
-        ctl.xhr = x; x.send(file.size ? file.slice(start, end) : null);
-      });
-      if (r.status === 308) { const m = /bytes=0-(\d+)/.exec(r.getResponseHeader('Range') || ''); start = m ? +m[1] + 1 : end; continue; }
-      if (r.status >= 200 && r.status < 300) { result = JSON.parse(r.responseText); break; }
-      throw new Error(`アップロード失敗 (${r.status})`);
-    }
-    return result;
+    const loc = init.headers.get('Location'); if (!loc) throw new Error('アップロードの受付が取れませんでした');
+    return loc;
   },
+  uploadSession(loc, file, onProgress, ctl) { return putResumable(loc, file, onProgress, ctl); },
   async logout() {
     const t = state.token; clearToken(); LS.del('vault_email');
     if (t) { try { await fetch('https://oauth2.googleapis.com/revoke?token=' + encodeURIComponent(t), { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }); } catch {} }
@@ -297,6 +285,9 @@ const realBackend = {
 };
 
 // ---------- デモ用バックエンド（Google なしで画面確認） ----------
+const DEMO_FAIL = new URLSearchParams(location.search).get('fail') || '0';
+const MOCK_UPLOAD = DEMO && /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+const demoPending = new Map();
 function demoBackend() {
   const mk = (n) => {
     const out = []; const now = Date.now();
@@ -334,7 +325,13 @@ function demoBackend() {
     async checkSharing() { await sleep(300); return { folderPerms: [], sharedItems: state.items.filter((i) => i.shared) }; },
     async unshare(id) { await sleep(200); raw.forEach((r) => { if (r.id === id) r.shared = false; }); },
     async ensureFolder() { return 'demo-root'; },
-    async upload(file, meta, onProgress, ctl) { for (let p = 0; p <= file.size; p += Math.max(1, file.size / 20)) { if (ctl.cancelled) throw new Error('cancelled'); onProgress(Math.min(p, file.size)); await sleep(80); } const r = { id: 'up' + Date.now() + Math.random(), name: meta.name, mimeType: file.type || 'image/jpeg', size: file.size, createdTime: new Date().toISOString(), modifiedTime: meta.modifiedTime, parents: ['demo-root'], hasThumbnail: true, appProperties: meta.appProperties, starred: false, shared: false, _hue: 200 }; raw.push(r); return r; },
+    async initUpload(file, meta) { await sleep(30); const id = 'up' + Date.now() + Math.random().toString(36).slice(2); demoPending.set(id, { file, meta }); return MOCK_UPLOAD ? `${location.origin}/__mock_upload/${id}?fail=${encodeURIComponent(DEMO_FAIL)}` : 'demo:' + id; },
+    async uploadSession(loc, file, onProgress, ctl) {
+      if (loc.startsWith('demo:')) { for (let p = 0; p <= file.size; p += Math.max(1, file.size / 10)) { if (ctl.cancelled) throw new Error('cancelled'); onProgress(Math.min(p, file.size)); await sleep(40); } }
+      else { await putResumable(loc, file, onProgress, ctl); }
+      const id = loc.split(/[:/?]/).filter(Boolean).find((x) => x.startsWith('up')); const { meta } = demoPending.get(id) || { meta: { name: file.name } }; demoPending.delete(id);
+      const r = { id, name: meta.name, mimeType: file.type || 'image/jpeg', size: file.size, createdTime: new Date().toISOString(), modifiedTime: meta.modifiedTime, parents: ['demo-root'], hasThumbnail: true, appProperties: meta.appProperties, starred: false, shared: false, _hue: 200 }; raw.push(r); return r;
+    },
     async logout() {}
   };
 }
@@ -747,10 +744,84 @@ async function fixDate(it) {
 }
 
 // ---------- アップロード（iPhone → Drive） ----------
-$('#uploadBtn').onclick = () => $('#filePicker').click();
-$('#filePicker').addEventListener('change', async (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; if (files.length) await uploadFiles(files); });
-const upCtl = { cancelled: false, xhr: null };
-$('#upCancel').onclick = () => { upCtl.cancelled = true; if (upCtl.xhr) try { upCtl.xhr.abort(); } catch {} };
+// たくさん選んでも最後まで上がるように:
+//  1) 先に全部の受付（resumable セッション）を取る … ここだけログインが要る。受付後はログインが切れても送れる
+//  2) 3 件ずつ並行で送る。通信が切れたら、届いたところから自動で続きを送る
+//  3) 送っている間は画面を暗くしない（Wake Lock）。失敗した分は最後に「もう一度」で送り直せる
+const UP_CONCURRENCY = 3, PREP_CONCURRENCY = 4, CHUNK = 8 * 1024 * 1024; // CHUNK は 256KB の倍数
+const upCtl = { cancelled: false, xhrs: new Set() };
+const upState = { running: false, failed: [] };
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); }
+    if (!on && wakeLock) { const w = wakeLock; wakeLock = null; await w.release(); }
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && upState.running) keepAwake(true); });
+window.addEventListener('beforeunload', (e) => { if (upState.running) { e.preventDefault(); e.returnValue = ''; } });
+
+$('#uploadBtn').onclick = () => {
+  if (upState.running) { toast('いまアップロード中です。終わってから追加してください'); return; }
+  // 受付を取る間（最初の数十秒）だけログインが要る。残りが少なければ、写真を選ぶ前にログインし直してもらう
+  if (!DEMO && (!state.token || state.tokenExp - Date.now() < 15 * 60000)) {
+    if (confirm('ログインの有効時間が残り少ないため、先にログインし直します。\n戻ってきたら、もう一度 ⇧ を押して写真を選んでください。')) { LS.set('vault_resume', { y: window.scrollY, filter: state.filter }); location.assign(authUrl()); }
+    return;
+  }
+  $('#filePicker').click();
+};
+$('#filePicker').addEventListener('change', async (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
+$('#upCancel').onclick = () => { if (!confirm('アップロードを中止しますか？（送り終わった写真は残ります）')) return; upCtl.cancelled = true; for (const x of upCtl.xhrs) { try { x.abort(); } catch {} } };
+
+function xhrPut(url, headers, body, onProgress, ctl) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest(); x.open('PUT', url); x.timeout = 180000;
+    for (const [k, v] of Object.entries(headers)) x.setRequestHeader(k, v);
+    if (onProgress) x.upload.onprogress = (e) => onProgress(e.loaded);
+    x.onload = () => resolve(x);
+    x.onerror = () => reject(new Error('通信エラー'));
+    x.ontimeout = () => reject(new Error('時間切れ'));
+    x.onabort = () => reject(new Error(ctl.cancelled ? 'cancelled' : '通信が切れました'));
+    x.onloadend = () => ctl.xhrs.delete(x);
+    ctl.xhrs.add(x); x.send(body);
+  });
+}
+const rangeEnd = (x) => { const m = /bytes=0-(\d+)/.exec(x.getResponseHeader('Range') || ''); return m ? +m[1] + 1 : 0; };
+const waitOnline = () => (navigator.onLine === false ? new Promise((r) => window.addEventListener('online', r, { once: true })) : Promise.resolve());
+const parseJSON = (t) => { try { return JSON.parse(t || '{}'); } catch { return {}; } };
+// Google の resumable アップロード: 8MB ずつ送る。切れたら「どこまで届いたか」を聞いて続きから送る
+async function putResumable(loc, file, onProgress, ctl) {
+  let start = 0, fails = 0;
+  const report = (n) => onProgress && onProgress(Math.min(file.size, n));
+  for (;;) {
+    if (ctl.cancelled) throw new Error('cancelled');
+    const end = Math.min(file.size, start + CHUNK);
+    let r = null;
+    try {
+      r = await xhrPut(loc, { 'Content-Range': file.size ? `bytes ${start}-${end - 1}/${file.size}` : 'bytes */0' }, file.size ? file.slice(start, end) : null, (n) => report(start + n), ctl);
+    } catch (e) { if (e.message === 'cancelled') throw e; }
+    if (r && r.status >= 200 && r.status < 300) { report(file.size); return parseJSON(r.responseText); }
+    if (r && r.status === 308) { start = rangeEnd(r); fails = 0; continue; }
+    if (r && (r.status === 404 || r.status === 410)) throw new Error('アップロードの受付が切れました');
+    if (r && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) throw new Error(`アップロード失敗 (${r.status})`);
+    // 通信エラー・時間切れ・混雑（5xx/429）: 少し待って、届いた位置を聞いてから続ける
+    if (++fails > 10) throw new Error(r ? `アップロード失敗 (${r.status})` : '通信エラーが続きました');
+    await waitOnline(); await sleep(Math.min(30000, 800 * 2 ** fails));
+    try {
+      const st = await xhrPut(loc, { 'Content-Range': `bytes */${file.size}` }, null, null, ctl);
+      if (st.status >= 200 && st.status < 300) { report(file.size); return parseJSON(st.responseText); }
+      if (st.status === 308) start = rangeEnd(st);
+      else if (st.status === 404 || st.status === 410) throw new Error('アップロードの受付が切れました');
+    } catch (e) { if (e.message === 'cancelled' || /受付が切れ/.test(e.message)) throw e; }
+    report(start);
+  }
+}
+// 同時に n 件ずつ処理する
+async function runPool(items, n, fn) {
+  let i = 0;
+  const worker = async () => { while (i < items.length) { const it = items[i++]; await fn(it); } };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+}
 async function readExifDate(file) { // JPEG の DateTimeOriginal を読む（HEIC は iOS が JPEG に変換して渡してくることが多い）
   try {
     if (!/jpe?g/i.test(file.type) && !/\.jpe?g$/i.test(file.name)) return NaN;
@@ -773,28 +844,64 @@ async function readExifDate(file) { // JPEG の DateTimeOriginal を読む（HEI
   return NaN;
 }
 async function uploadFiles(files) {
-  if (state.loading) { toast('読み込みが終わってからアップロードしてください'); return; }
-  const existing = new Set(state.items.map((i) => i.name.toLowerCase() + '|' + i.size));
-  const todo = files.filter((f) => !existing.has(f.name.toLowerCase() + '|' + f.size)); const skipped = files.length - todo.length;
+  if (upState.running) { toast('いまアップロード中です。終わってから追加してください'); return; }
+  if (state.loading) { toast('<span class="spin"></span> 一覧の読み込みが終わるのを待っています…', 0); while (state.loading) await sleep(300); toastOff(); }
+  // 保管済み（同じ名前・同じ大きさ）と、同じ写真の二重選択は飛ばす
+  const existing = new Set(state.items.map((i) => i.name.toLowerCase() + '|' + i.size)); const seen = new Set();
+  const todo = files.filter((f) => { const k = f.name.toLowerCase() + '|' + f.size; if (existing.has(k) || seen.has(k)) return false; seen.add(k); return true; });
+  const skipped = files.length - todo.length;
   if (!todo.length) { toast(`すべて保管済みでした（${skipped} 件をスキップ）`); return; }
-  const total = todo.reduce((s, f) => s + f.size, 0); let doneBytes = 0, ok = 0; const errors = [];
-  upCtl.cancelled = false; $('#upbar').classList.remove('hidden');
-  for (let i = 0; i < todo.length; i++) {
-    const f = todo[i]; if (upCtl.cancelled) break;
-    $('#upText').textContent = `アップロード中 ${i + 1}/${todo.length}：${f.name}（${fmtBytes(f.size)}）`;
+  const jobs = todo.map((f) => ({ f, loc: null, sent: 0, status: 'wait', err: '' }));
+  const total = todo.reduce((sum, f) => sum + f.size, 0) || 1; const t0 = Date.now();
+  upState.running = true; upState.failed = []; upCtl.cancelled = false; upCtl.xhrs = new Set(); state.noRedirect = true;
+  banner('upfail', null); keepAwake(true); $('#upbar').classList.remove('hidden'); $('#upProg').style.width = '0';
+  const count = (st) => jobs.filter((j) => j.status === st).length;
+  let lastPaint = 0;
+  const paint = (force) => {
+    const now = Date.now(); if (!force && now - lastPaint < 250) return; lastPaint = now;
+    const sent = jobs.reduce((sum, j) => sum + j.sent, 0); const pct = sent / total * 100; const ok = count('ok'), ng = count('fail');
+    const el = (now - t0) / 1000; const rest = pct > 3 && el > 5 ? Math.round(el * (100 - pct) / pct / 60) : null;
+    $('#upText').textContent = `アップロード中 ${ok}/${jobs.length} 件${ng ? `・失敗 ${ng}` : ''}${rest !== null ? `（残り約 ${Math.max(1, rest)} 分）` : ''}　画面は開いたままにしてください`;
+    $('#upProg').style.width = pct.toFixed(1) + '%';
+  };
+  // 1) 受付: 撮影日を読み、年・月のフォルダを用意し、受付 URL を取る
+  const folderCache = new Map(); // 同じ月のフォルダを同時に二重で作らないよう、約束（Promise）を共有する
+  const folderFor = (name, parent) => { const k = parent + '/' + name; if (!folderCache.has(k)) { const p = drive.ensureFolder(name, parent); folderCache.set(k, p); p.catch(() => folderCache.delete(k)); } return folderCache.get(k); };
+  let prepared = 0;
+  $('#upText').textContent = `準備中 0/${jobs.length} 件…`;
+  await runPool(jobs, PREP_CONCURRENCY, async (j) => {
+    if (upCtl.cancelled) return;
     try {
-      let t = await readExifDate(f); if (isNaN(t)) t = f.lastModified || Date.now(); const d = new Date(t);
-      const yFolder = await drive.ensureFolder(String(d.getFullYear()), state.vaultId); const mFolder = await drive.ensureFolder(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`, yFolder);
-      const meta = { name: f.name, parents: [mFolder], modifiedTime: d.toISOString(), appProperties: { captured: d.toISOString(), src: 'iphone-app' } };
-      const res = await drive.upload(f, meta, (b) => { $('#upProg').style.width = ((doneBytes + b) / total * 100).toFixed(1) + '%'; }, upCtl);
-      doneBytes += f.size; ok++; if (res) { state.raw.push(res); const it = toItem(res); state.items.push(it); }
-    } catch (e) { if (e.message === 'cancelled') break; errors.push(`${f.name}: ${e.message}`); console.error(e); }
-  }
+      let t = await readExifDate(j.f); if (isNaN(t)) t = j.f.lastModified || Date.now(); const d = new Date(t);
+      const y = await folderFor(String(d.getFullYear()), state.vaultId); const mf = await folderFor(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`, y);
+      const meta = { name: j.f.name, parents: [mf], modifiedTime: d.toISOString(), appProperties: { captured: d.toISOString(), src: 'iphone-app' } };
+      j.loc = await drive.initUpload(j.f, meta);
+    } catch (e) { j.status = 'fail'; j.err = e.message; }
+    prepared++; $('#upText').textContent = `準備中 ${prepared}/${jobs.length} 件…`;
+  });
+  // 2) 送信: 3 件ずつ。通信が切れても自動で続きから
+  await runPool(jobs.filter((j) => j.loc), UP_CONCURRENCY, async (j) => {
+    if (upCtl.cancelled) return;
+    j.status = 'send';
+    try {
+      const res = await drive.uploadSession(j.loc, j.f, (b) => { j.sent = b; paint(); }, upCtl);
+      j.status = 'ok'; j.sent = j.f.size;
+      if (res && res.id) { state.raw.push(res); state.items.push(toItem(res)); }
+    } catch (e) { j.status = e.message === 'cancelled' ? 'cancel' : 'fail'; j.err = e.message; }
+    paint(true);
+  });
+  // 3) 後片付けと結果
+  upState.running = false; state.noRedirect = false; keepAwake(false);
   $('#upbar').classList.add('hidden'); $('#upProg').style.width = '0';
   sortItems(); syncRawFlags(); render(false);
+  const ok = count('ok'); const failed = jobs.filter((j) => j.status === 'fail' || (upCtl.cancelled && j.status !== 'ok'));
+  upState.failed = failed.map((j) => j.f);
   if (state.quota && ok) { try { await drive.init(); updateQuota(); } catch {} }
-  toast(`${ok} 件をアップロードしました${skipped ? `（${skipped} 件は保管済み）` : ''}${errors.length ? `／失敗 ${errors.length} 件` : ''}${upCtl.cancelled ? '（中止）' : ''}`, 5000);
-  if (errors.length) alert('失敗したファイル:\n' + errors.slice(0, 10).join('\n'));
+  toast(`${ok} 件をアップロードしました${skipped ? `（${skipped} 件は保管済み）` : ''}${upCtl.cancelled ? '（中止）' : ''}`, 5000);
+  if (upState.failed.length) {
+    const why = [...new Set(failed.map((j) => (j.err === 'cancelled' || (!j.err && upCtl.cancelled) ? '途中で中止しました' : j.err)).filter(Boolean))].slice(0, 2).join('、');
+    banner('upfail', `<b>${upState.failed.length} 件がまだアップロードできていません</b>${why ? `（${esc(why)}）` : ''}。「もう一度」で残りだけ送ります。アプリを閉じてしまったときは、同じ写真をもう一度まとめて選べば、まだの分だけ送られます。`, 'もう一度', () => uploadFiles(upState.failed), true);
+  }
 }
 
 // ---------- 初回設定・ログイン画面 ----------
