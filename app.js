@@ -6,7 +6,7 @@
 'use strict';
 
 // ---------- 基本 ----------
-const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.1' }, window.VAULT_CONFIG || {});
+const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.2' }, window.VAULT_CONFIG || {});
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const LS = {
@@ -272,7 +272,7 @@ const realBackend = {
   async initUpload(file, meta) {
     // 受付（resumable セッション）を取る。受付 URL は 1 週間有効で、送信そのものにはログインが要らない
     const init = await gfetch(`${UPLOAD_API}?uploadType=resumable&fields=${encodeURIComponent(FILE_FIELDS)}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': file.type || 'application/octet-stream', 'X-Upload-Content-Length': String(file.size) }, body: JSON.stringify(meta)
+      method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': fileType(file), 'X-Upload-Content-Length': String(file.size) }, body: JSON.stringify(meta)
     });
     const loc = init.headers.get('Location'); if (!loc) throw new Error('アップロードの受付が取れませんでした');
     return loc;
@@ -804,11 +804,16 @@ $('#uploadBtn').onclick = () => {
     if (confirm('ログインの有効時間が残り少ないため、先にログインし直します。\n戻ってきたら、もう一度 ⇧ を押して写真を選んでください。')) { LS.set('vault_resume', { y: window.scrollY, filter: state.filter }); location.assign(authUrl()); }
     return;
   }
+  banner('pickwait', '<span class="spin"></span> 写真を選んで ✓（追加）を押すと、iPhone が写真の準備をします。<b>枚数が多いと数分かかります</b>。✓ は 1 回だけ押して、そのまま待ってください。', null, null, false);
   $('#filePicker').click();
 };
-$('#filePicker').addEventListener('change', async (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; ulog('pick', { n: files.length, mb: Math.round(files.reduce((a, f) => a + f.size, 0) / 1e6), types: [...new Set(files.map((f) => f.type || '?'))].slice(0, 5), tokenMin: Math.round((state.tokenExp - Date.now()) / 60000) }); if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
+$('#filePicker').addEventListener('cancel', () => banner('pickwait', null));
+$('#filePicker').addEventListener('change', async (e) => { banner('pickwait', null); const files = Array.from(e.target.files || []); e.target.value = ''; ulog('pick', { n: files.length, mb: Math.round(files.reduce((a, f) => a + f.size, 0) / 1e6), types: [...new Set(files.map((f) => f.type || '?'))].slice(0, 5), exts: [...new Set(files.map((f) => (f.name.split('.').pop() || '').toLowerCase()))].slice(0, 6), tokenMin: Math.round((state.tokenExp - Date.now()) / 60000) }); if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
 $('#upCancel').onclick = () => { if (!confirm('アップロードを中止しますか？（送り終わった写真は残ります）')) return; upCtl.cancelled = true; for (const x of upCtl.xhrs) { try { x.abort(); } catch {} } };
 
+const EXT_TYPES = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', heic: 'image/heic', heif: 'image/heif', gif: 'image/gif', webp: 'image/webp', mov: 'video/quicktime', mp4: 'video/mp4', m4v: 'video/x-m4v' };
+// Safari が種類を取り違えることがあるので、名前（拡張子）が分かればそれを優先する
+function fileType(f) { const ext = (f.name.split('.').pop() || '').toLowerCase(); return EXT_TYPES[ext] || f.type || 'application/octet-stream'; }
 function xhrPut(url, headers, body, onProgress, ctl) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest(); x.open('PUT', url); x.timeout = 180000;
@@ -913,7 +918,7 @@ async function uploadFiles(files) {
     try {
       let t = await readExifDate(j.f); if (isNaN(t)) t = j.f.lastModified || Date.now(); const d = new Date(t);
       const y = await folderFor(String(d.getFullYear()), state.vaultId); const mf = await folderFor(`${d.getFullYear()}-${pad2(d.getMonth() + 1)}`, y);
-      const meta = { name: j.f.name, parents: [mf], modifiedTime: d.toISOString(), appProperties: { captured: d.toISOString(), src: 'iphone-app' } };
+      const meta = { name: j.f.name, mimeType: fileType(j.f), parents: [mf], modifiedTime: d.toISOString(), appProperties: { captured: d.toISOString(), src: 'iphone-app' } };
       j.loc = await drive.initUpload(j.f, meta);
     } catch (e) { j.status = 'fail'; j.err = e.message; }
     prepared++; $('#upText').textContent = `準備中 ${prepared}/${jobs.length} 件…`;
