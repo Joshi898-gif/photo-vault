@@ -6,7 +6,7 @@
 'use strict';
 
 // ---------- 基本 ----------
-const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.3.2' }, window.VAULT_CONFIG || {});
+const CFG = Object.assign({ clientId: '', vaultPath: 'Gin/写真保管庫', appName: '写真保管庫', version: '1.4.0' }, window.VAULT_CONFIG || {});
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const LS = {
@@ -15,8 +15,10 @@ const LS = {
   del(k) { try { localStorage.removeItem(k); } catch {} }
 };
 const DEMO = new URLSearchParams(location.search).has('demo');
-const API = 'https://www.googleapis.com/drive/v3';
-const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3/files';
+// 開発用: localhost で ?mockapi=1 のとき、PCツール/dev_server.py が真似る Google ドライブにつなぐ（本番の住所では働かない）
+const MOCKAPI = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && new URLSearchParams(location.search).has('mockapi');
+const API = MOCKAPI ? location.origin + '/__drive/drive/v3' : 'https://www.googleapis.com/drive/v3';
+const UPLOAD_API = MOCKAPI ? location.origin + '/__drive/upload/drive/v3/files' : 'https://www.googleapis.com/upload/drive/v3/files';
 const SCOPE = 'https://www.googleapis.com/auth/drive';
 const FILE_FIELDS = 'id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,parents,thumbnailLink,hasThumbnail,imageMediaMetadata(time,width,height),videoMediaMetadata(width,height,durationMillis),appProperties,starred,shared,webViewLink';
 const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent);
@@ -36,7 +38,9 @@ const state = {
   loading: false,
   unlockUntil: 0,            // 削除ロックの一時解除期限（ms）
   trash: null, trashRaw: [], // Drive のゴミ箱（ゴミ箱タブを開いたときに読む）
-  backup: null               // PC が書く バックアップ状況.json
+  backup: null,              // PC が書く バックアップ状況.json
+  thumbMap: null,            // PC が作った小さい画像: 元ファイルの MD5 -> Drive のファイル ID
+  listFresh: 0               // 一覧を Google から取り直した時刻（小さい画像のリンクが新しいかの目安）
 };
 
 const fmtBytes = (n) => { n = +n || 0; if (n >= 1e12) return (n / 1e12).toFixed(2) + ' TB'; if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB'; if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB'; if (n >= 1e3) return (n / 1e3).toFixed(0) + ' KB'; return n + ' B'; };
@@ -187,12 +191,16 @@ const realBackend = {
     if (!state.vaultId) state.vaultId = await this.findVault(true);
     // フォルダ階層（幅優先）
     const folders = new Map([[state.vaultId, { id: state.vaultId, name: state.folderName, parent: null }]]);
+    const special = {}; // 「_thumbs」「_重複」など _ で始まるフォルダは管理用。写真の一覧には入れない
     let frontier = [state.vaultId];
     while (frontier.length) {
       const next = [];
       for (const ids of chunk(frontier, 30)) {
-        const fs = await listAll(`mimeType='application/vnd.google-apps.folder' and trashed=false and (${ids.map((i) => `'${i}' in parents`).join(' or ')})`, 'files(id,name,parents)');
-        for (const f of fs) { if (!folders.has(f.id)) { folders.set(f.id, { id: f.id, name: f.name, parent: (f.parents || [])[0] }); next.push(f.id); } }
+        const fs = await listAll(`mimeType='application/vnd.google-apps.folder' and trashed=false and (${ids.map((i) => `'${i}' in parents`).join(' or ')})`, 'files(id,name,parents,shared)');
+        for (const f of fs) {
+          if (f.name.startsWith('_')) { if (!special[f.name]) special[f.name] = f.id; continue; }
+          if (!folders.has(f.id)) { folders.set(f.id, { id: f.id, name: f.name, parent: (f.parents || [])[0], shared: !!f.shared }); next.push(f.id); }
+        }
       }
       frontier = next;
     }
@@ -215,34 +223,71 @@ const realBackend = {
       const bs = await listAll(`name='バックアップ状況.json' and '${state.vaultId}' in parents and trashed=false`, 'files(id)');
       if (bs.length) backup = await gjson(`${API}/files/${bs[0].id}?alt=media`);
     } catch (e) { console.warn('バックアップ状況 読めず', e); }
-    return { raw, folders: Array.from(folders.values()), index, backup };
+    return { raw, folders: Array.from(folders.values()), index, backup, thumbsFolder: special._thumbs || null };
+  },
+  // PC が作った小さい画像（_thumbs/<MD5>.jpg）の一覧。名前から Drive の ID を引けるようにする
+  async loadThumbMap(folderId) {
+    const map = {};
+    for (const f of await listAll(`'${folderId}' in parents and trashed=false`, 'files(id,name)')) map[f.name.replace(/\.jpg$/i, '')] = f.id;
+    return map;
   },
   async loadTrash() {
+    // フォルダごと消された写真は、親フォルダが普通の一覧に無い。ゴミ箱の中のフォルダも調べて、保管庫の下にあったものを拾う
+    const known = new Set(state.folders.keys()); const tf = new Map();
+    try { for (const f of await listAll(`trashed=true and mimeType='application/vnd.google-apps.folder'`, 'files(id,name,parents)')) tf.set(f.id, { parent: (f.parents || [])[0], name: f.name }); } catch (e) { console.warn('ゴミ箱のフォルダ一覧に失敗', e); }
+    const underVault = (id) => { let cur = id, g = 0; while (cur && g++ < 20) { if (known.has(cur)) return true; const f = tf.get(cur); if (!f || f.name.startsWith('_')) return false; cur = f.parent; } return false; };
+    const parents = [...known, ...[...tf.keys()].filter(underVault)];
     const out = [];
-    for (const ids of chunk(Array.from(state.folders.keys()), 25)) {
+    for (const ids of chunk(parents, 25)) {
       out.push(...await listAll(`trashed=true and (mimeType contains 'image/' or mimeType contains 'video/') and (${ids.map((i) => `'${i}' in parents`).join(' or ')})`, `files(${FILE_FIELDS},trashedTime)`));
     }
     return out;
   },
-  async untrash(ids) { for (const id of ids) await patch(id, { trashed: false }); },
-  async refreshThumbLink(item) { const j = await gjson(`${API}/files/${item.id}?fields=thumbnailLink,hasThumbnail`); item.thumb = j.thumbnailLink || ''; return item.thumb; },
-  async thumbBlob(item, size) {
-    const tryLink = async (link) => {
-      if (!link) throw new Error('no-thumb');
-      const u = /=s\d+(-[a-z]+)?$/.test(link) ? link.replace(/=s\d+(-[a-z]+)?$/, `=s${size}`) : link + `=s${size}`;
-      const r = await gfetch(u, { mode: 'cors' }); return r.blob();
-    };
-    try { return await tryLink(item.thumb); }
-    catch (e) {
-      if (e && (e.status === 403 || e.status === 404 || e.message === 'no-thumb')) { try { return await tryLink(await this.refreshThumbLink(item)); } catch {} }
-      if (!item.video && item.size && item.size < 8e6) { const r = await gfetch(`${API}/files/${item.id}?alt=media`); return r.blob(); }
-      throw e;
+  async untrash(ids) {
+    for (const id of ids) {
+      const r = state.trashRaw.find((x) => x.id === id); const par = r && (r.parents || [])[0];
+      if (par && !state.folders.has(par)) {
+        // 元のフォルダがもう無い（ゴミ箱の中）: 保管庫の直下へ戻す。パソコンの整理が年月フォルダへ入れ直す
+        await gjson(`${API}/files/${id}?addParents=${state.vaultId}&removeParents=${par}&fields=id,parents`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: false }) });
+        r.parents = [state.vaultId];
+      } else await patch(id, { trashed: false });
     }
+  },
+  async refreshThumbLink(item) { const j = await gjson(`${API}/files/${item.id}?fields=thumbnailLink,hasThumbnail`); item.thumb = j.thumbnailLink || ''; return item.thumb; },
+  // 画像の取り方（上から順に試す）。戻り値 { blob, persist }。persist=false は iPhone に溜めない（原本そのもの）
+  //  1) PC が作った小さい画像（_thumbs）… 確実で軽い
+  //  2) Google の小さい画像のリンク … Web アプリから使えるかは環境しだい。3 回続けて失敗したら 7 日間は試さない
+  //  3) 原本を取り、一覧用は iPhone の中で縮める
+  async thumbBlob(item, size) {
+    if (!state.token || state.tokenExp < Date.now()) throw new Error('ログインが必要です'); // 画像のために勝手に Google へ移動しない
+    const small = size <= 400;
+    if (small && item.md5) {
+      await thumbs.mapReady;
+      const tid = state.thumbMap && state.thumbMap[item.md5];
+      if (tid) { try { const b = await (await gfetch(`${API}/files/${tid}?alt=media`)).blob(); tstat('pc'); return { blob: b, persist: true }; } catch (e) { tstat('pcErr', e); } }
+    }
+    if (item.thumb) {
+      const u = /=s\d+(-[a-z]+)?$/.test(item.thumb) ? item.thumb.replace(/=s\d+(-[a-z]+)?$/, `=s${size}`) : item.thumb + `=s${size}`;
+      for (const m of ['noauth', 'auth']) {
+        if (!linkUsable(m)) continue;
+        try {
+          const r = await fetch(u, { mode: 'cors', credentials: 'omit', headers: m === 'auth' ? { Authorization: 'Bearer ' + state.token } : {} });
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const b = await r.blob(); if (!b.size || (b.type && !b.type.startsWith('image/'))) throw new Error('画像ではない応答');
+          linkResult(m, true); tstat(m === 'auth' ? 'linkAuth' : 'link'); return { blob: b, persist: true };
+        } catch (e) { linkResult(m, false, e); }
+      }
+    }
+    if (item.video) { tstat('noVideoThumb'); throw new Error('動画の画像はパソコンの整理のあとに出ます'); }
+    if (item.size > 60e6) throw new Error('大きすぎて表示できません');
+    let b = await (await gfetch(`${API}/files/${item.id}?alt=media`)).blob(); tstat(small ? 'orig' : 'origBig');
+    if (small) { try { b = await shrink(b, 360); return { blob: b, persist: true }; } catch (e) { tstat('shrinkErr', e); } }
+    return { blob: b, persist: false };
   },
   async downloadBlob(item) { const r = await gfetch(`${API}/files/${item.id}?alt=media`); return r.blob(); },
   async trash(ids) { for (const id of ids) await patch(id, { trashed: true }); },
   async setStar(ids, on) { for (const id of ids) await patch(id, { starred: !!on }); },
-  async setCaptured(id, iso) { return patch(id, { modifiedTime: iso, appProperties: { captured: iso } }); },
+  async setCaptured(id, iso) { return patch(id, { modifiedTime: iso, appProperties: { captured: iso, src: 'manual' } }); },
   vaultLink() { return state.vaultId ? `https://drive.google.com/drive/folders/${state.vaultId}` : 'https://drive.google.com/'; },
   fileLink(item) { return item.link || `https://drive.google.com/file/d/${item.id}/view`; },
   previewUrl(item) { return `https://drive.google.com/file/d/${item.id}/preview`; },
@@ -253,8 +298,7 @@ const realBackend = {
     res.sharedItems = state.items.filter((i) => i.shared);
     // サブフォルダの共有も確認
     for (const f of state.folders.values()) {
-      if (f.id === state.vaultId) continue;
-      try { const j = await gjson(`${API}/files/${f.id}?fields=shared,name`); if (j.shared) res.folderPerms.push({ id: '', type: 'folder', role: 'folder', displayName: `サブフォルダ「${j.name}」`, folderId: f.id }); } catch {}
+      if (f.id !== state.vaultId && f.shared) res.folderPerms.push({ id: '', type: 'folder', role: 'folder', displayName: `サブフォルダ「${f.name}」`, folderId: f.id });
     }
     return res;
   },
@@ -354,15 +398,21 @@ function toItem(f) {
   resolveDate(it); return it;
 }
 function resolveDate(it) {
+  // 優先順: 手で直した日付 > PC が写真・動画から読んだ日付 > Google が読んだ EXIF > アップロード時に iPhone が持っていた日付 > 推定（更新日時・アップロード日）
   let t = NaN, src = '';
-  if (it.app && it.app.captured) { t = Date.parse(it.app.captured); src = 'app'; }
-  if (isNaN(t) && state.index && state.index.files) {
+  const cap = it.app && it.app.captured ? Date.parse(it.app.captured) : NaN;
+  if (!isNaN(cap) && it.app.src !== 'iphone-app') { t = cap; src = 'app'; }
+  let e = null;
+  if (state.index && state.index.files) {
     const dir = folderPath(it.parent); const key = dir === null ? null : (dir ? dir + '/' : '') + it.name;
-    let e = key != null ? state.index.files[key] : null;
+    e = key != null ? state.index.files[key] : null;
     if (!e && state.index.byName) { const cands = state.index.byName[it.name]; if (cands) e = cands.find((c) => !it.size || !c.s || c.s === it.size) || null; }
-    if (e && e.t) { t = Date.parse(e.t); src = 'index'; if (e.w && !it.w) { it.w = e.w; it.h = e.h; } if (e.d && !it.dur) it.dur = e.d * 1000; }
+    if (e) { if (e.w && !it.w) { it.w = e.w; it.h = e.h; } if (e.d && !it.dur) it.dur = e.d * 1000; }
   }
+  if (isNaN(t) && e && e.t && e.src !== 'mtime') { t = Date.parse(e.t); src = 'index'; }
   if (isNaN(t) && it.exif) { t = parseExif(it.exif); src = 'exif'; }
+  if (isNaN(t) && !isNaN(cap)) { t = cap; src = 'phone'; }
+  if (isNaN(t) && e && e.t) { t = Date.parse(e.t); src = 'modified'; }
   if (isNaN(t)) { t = Date.parse(it.modified); src = 'modified'; }
   if (isNaN(t)) { t = Date.parse(it.created); src = 'created'; }
   it.t = t; it.src = src; it.estimated = (src === 'modified' || src === 'created');
@@ -377,7 +427,41 @@ function rebuildItems() {
 function sortItems() { const d = state.order === 'desc' ? -1 : 1; state.items.sort((a, b) => (a.t - b.t) * d || (a.name < b.name ? -1 : 1)); }
 
 // ---------- サムネイル（Cache API + 同時数制限） ----------
-const thumbs = { cacheName: 'vault-thumbs-v1', queue: [], running: 0, MAX: 6, inflight: new Map(), count: null };
+// v2: 以前の版（v1）は原本をそのまま溜めていたことがあるので、名前を変えて古い分は起動時に消す
+const thumbs = { cacheName: 'vault-thumbs-v2', queue: [], running: 0, MAX: 6, inflight: new Map(), count: null,
+  mapReady: Promise.resolve(), mem: new Map(), stats: {}, errs: {}, logged: false,
+  mode: LS.get('vault_thumb_mode', {}), fails: { noauth: 0, auth: 0 } };
+function tstat(k, e) {
+  thumbs.stats[k] = (thumbs.stats[k] || 0) + 1; if (e && !thumbs.errs[k]) thumbs.errs[k] = String(e.message || e).slice(0, 80);
+  const n = Object.values(thumbs.stats).reduce((a, b) => a + b, 0);
+  if (!thumbs.logged && n >= 24) { thumbs.logged = true; ulog('thumbs', { stats: Object.assign({}, thumbs.stats), errs: Object.assign({}, thumbs.errs), mode: thumbs.mode, map: state.thumbMap ? Object.keys(state.thumbMap).length : 0 }); saveUploadLog(); }
+}
+// Google の小さい画像のリンクが使えるか。'ng' は 7 日たったら試し直す
+function linkUsable(m) { const v = thumbs.mode[m]; return !(v && v.ng && Date.now() - v.ng < 7 * 86400000); }
+function linkResult(m, ok, e) {
+  if (ok) { thumbs.fails[m] = 0; if (!thumbs.mode[m] || !thumbs.mode[m].ok) { thumbs.mode[m] = { ok: Date.now() }; LS.set('vault_thumb_mode', thumbs.mode); } return; }
+  tstat(m === 'auth' ? 'linkAuthErr' : 'linkErr', e);
+  if (Date.now() - state.listFresh > 2 * 3600000) return; // 古い一覧のリンクは期限切れかもしれないので、判定に使わない
+  if (++thumbs.fails[m] >= 3 && !(thumbs.mode[m] && thumbs.mode[m].ok)) { thumbs.mode[m] = { ng: Date.now(), why: String(e && e.message || e).slice(0, 60) }; LS.set('vault_thumb_mode', thumbs.mode); }
+}
+// 原本を iPhone の中で小さくする（1 枚ずつ。まとめてやるとメモリが足りなくなる）
+let shrinkChain = Promise.resolve();
+function shrink(blob, short) {
+  const run = () => new Promise((res, rej) => {
+    const url = URL.createObjectURL(blob); const img = new Image();
+    img.onload = () => {
+      try {
+        const k = Math.min(1, short / Math.max(1, Math.min(img.naturalWidth, img.naturalHeight)));
+        const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(img.naturalWidth * k)); c.height = Math.max(1, Math.round(img.naturalHeight * k));
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        c.toBlob((b) => { c.width = c.height = 0; URL.revokeObjectURL(url); b ? res(b) : rej(new Error('縮小に失敗')); }, 'image/jpeg', 0.78);
+      } catch (err) { URL.revokeObjectURL(url); rej(err); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('この形式は縮小できません')); };
+    img.src = url;
+  });
+  const p = shrinkChain.then(run, run); shrinkChain = p.catch(() => {}); return p;
+}
 async function thumbCache() { if (DEMO) return null; try { return await caches.open(thumbs.cacheName); } catch { return null; } }
 function thumbKey(id, size) { return `${location.origin}/__thumb/${encodeURIComponent(id)}/${size}`; }
 function getThumbUrl(item, size) {
@@ -393,11 +477,13 @@ async function pumpThumbs() {
     (async () => {
       try {
         const c = await thumbCache(); const k = thumbKey(job.item.id, job.size);
-        let blob = null;
-        if (c) { const hit = await c.match(k); if (hit) blob = await hit.blob(); }
+        let blob = thumbs.mem.get(k) || null;
+        if (!blob && c) { const hit = await c.match(k); if (hit) blob = await hit.blob(); }
         if (!blob) {
-          blob = await drive.thumbBlob(job.item, job.size);
-          if (c && blob && blob.size > 0) { c.put(k, new Response(blob, { headers: { 'Content-Type': blob.type || 'image/jpeg' } })).catch(() => {}); trimThumbCache(c); }
+          const r = await drive.thumbBlob(job.item, job.size);
+          blob = r instanceof Blob ? r : r.blob;
+          if (r instanceof Blob || r.persist) { if (c && blob && blob.size > 0) { c.put(k, new Response(blob, { headers: { 'Content-Type': blob.type || 'image/jpeg' } })).catch(() => {}); trimThumbCache(c); } }
+          else { thumbs.mem.set(k, blob); while (thumbs.mem.size > 5) thumbs.mem.delete(thumbs.mem.keys().next().value); } // 原本は直近の数枚だけ覚えておく（iPhone には溜めない）
         }
         job.resolve(URL.createObjectURL(blob));
       } catch (e) { job.reject(e); }
@@ -482,11 +568,14 @@ function banner(key, html, btnLabel, onClick, red) {
 // ---------- 起動・読み込み ----------
 async function boot() {
   applyFolderName();
-  if ('serviceWorker' in navigator && !DEMO) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && !DEMO && !MOCKAPI) navigator.serviceWorker.register('sw.js').catch(() => {});
+  try { caches.delete('vault-thumbs-v1'); } catch {} // 旧版が溜めた画像（原本を含むことがある）を消して iPhone の容量を空ける
+  if (!DEMO) { const tm = await idb.get('thumbmap'); if (tm && tm.map) state.thumbMap = tm.map; }
   if (!DEMO && !state.clientId) { show('setup'); return; }
   const r = DEMO ? null : handleRedirect();
   if (r && r !== 'ok') { show('login'); const m = $('#loginMsg'); m.classList.remove('hidden'); m.textContent = r === 'access_denied' ? 'Google でアクセスが許可されませんでした。もう一度お試しください。' : `ログインに失敗しました（${r}）。クライアント ID と、Google Cloud 側のリダイレクト URI（${redirectUri()}）を確認してください。`; return; }
   if (!DEMO) { loadToken(); state.email = LS.get('vault_email', ''); }
+  if (MOCKAPI) { state.token = 'mock'; state.tokenExp = Date.now() + 3600000; }
   if (!DEMO && !state.token) {
     // キャッシュがあればオフラインでも一覧を出す。なければログイン画面
     const cached = await idb.get('items');
@@ -505,12 +594,20 @@ async function startLoad() {
   try {
     await drive.init(); updateQuota();
     const res = await drive.loadAll((n) => toast(`<span class="spin"></span> ${n.toLocaleString()} 件 読み込み中…`, 0));
-    state.raw = res.raw; state.folders = new Map(res.folders.map((f) => [f.id, f])); state.index = res.index; state.backup = res.backup || null; state.trash = null;
+    state.raw = res.raw; state.folders = new Map(res.folders.map((f) => [f.id, f])); state.index = res.index; state.backup = res.backup || null; state.trash = null; state.listFresh = Date.now();
+    if (res.thumbsFolder && drive.loadThumbMap) {
+      // PC が作った小さい画像の一覧。前回の一覧があればすぐ使い、裏で取り直す。無ければ（最長 10 秒）待つ
+      const load = drive.loadThumbMap(res.thumbsFolder).then((map) => { state.thumbMap = map; idb.set('thumbmap', { folder: res.thumbsFolder, ts: Date.now(), map }); }).catch((e) => { console.warn('小さい画像の一覧に失敗', e); tstat('mapErr', e); });
+      if (!state.thumbMap) thumbs.mapReady = Promise.race([load, sleep(10000)]);
+    } else if (!res.thumbsFolder) { state.thumbMap = null; }
     rebuildItems(); render(true); toastOff();
     idb.set('items', { vaultId: state.vaultId, folders: res.folders, raw: res.raw, index: res.index, backup: state.backup, quota: state.quota, email: state.email, ts: Date.now() });
     checkBackupBanner();
     const resume = LS.get('vault_resume', null); if (resume) { LS.del('vault_resume'); setFilter(resume.filter || 'all'); window.scrollTo(0, resume.y || 0); }
     checkSharingBanner();
+    // ⇧ を押して写真を選んだのに、アプリに写真が届かなかった場合を記録する（iPhone の写真選択画面で止まったとき）
+    const lastEv = upLog[upLog.length - 1];
+    if (lastEv && lastEv.ev === 'open' && Date.now() - Date.parse(lastEv.t) > 60000) { ulog('nopick', { opened: lastEv.t }); saveUploadLog(); }
     const prevRun = LS.get(UPRUN_KEY, null);
     if (prevRun && !upState.running) {
       ulog('interrupted', { since: new Date(prevRun.t).toISOString(), n: prevRun.n }); LS.del(UPRUN_KEY);
@@ -572,6 +669,8 @@ function backupLine() {
 function checkBackupBanner() {
   if (!state.items.length) { banner('backup', null); return; }
   const b = state.backup; const age = b && b.time ? (Date.now() - Date.parse(b.time)) / 86400000 : Infinity;
+  const stopped = b && (b.dests || []).find((d) => d.ok === false && d.reason);
+  if (stopped) { banner('backup', `<b>パソコンのバックアップが止まっています</b>：${esc(stopped.reason)}。写真を自分で消した覚えがなければ、Claude に相談してください。`, null, null, true); return; }
   if (age <= 3) { banner('backup', null); return; }
   banner('backup', b && b.time ? `パソコンのバックアップが <b>${Math.floor(age)} 日前</b>から更新されていません。パソコンを起動しておいてください（毎日 12:40 に自動）。` : 'パソコンのバックアップがまだ取られていません。パソコンを起動しておいてください（毎日 12:40 に自動で取られます）。');
 }
@@ -659,7 +758,7 @@ $('#menuBtn').onclick = () => {
     { label: '&#128737; 共有チェック（私だけか確認）', fn: async () => { toast('<span class="spin"></span> 確認中…', 0); try { const r = await drive.checkSharing(); const n = r.folderPerms.length + r.sharedItems.length; toastOff(); if (!n) alert('共有はありません。あなただけがアクセスできる状態です。'); else { await checkSharingBanner(); window.scrollTo(0, 0); } } catch (e) { toast('確認に失敗: ' + esc(e.message), 5000); } } },
     { label: `&#8645; 並び順: ${state.order === 'desc' ? '新しい順 → 古い順にする' : '古い順 → 新しい順にする'}`, fn: () => { state.order = state.order === 'desc' ? 'asc' : 'desc'; LS.set('vault_order', state.order); sortItems(); render(false); window.scrollTo(0, 0); } },
     { label: '&#128193; Google ドライブでフォルダを開く', fn: () => window.open(drive.vaultLink(), '_blank') },
-    { label: '&#129529; サムネイルのキャッシュを消す（表示がおかしいとき）', fn: async () => { try { await caches.delete(thumbs.cacheName); } catch {} await idb.del('items'); toast('キャッシュを消しました'); render(false); } },
+    { label: '&#129529; サムネイルのキャッシュを消す（表示がおかしいとき）', fn: async () => { try { await caches.delete(thumbs.cacheName); } catch {} await idb.del('items'); await idb.del('thumbmap'); thumbs.mem.clear(); thumbs.mode = {}; LS.del('vault_thumb_mode'); toast('キャッシュを消しました'); render(false); } },
     { label: '&#128682; ログアウト', cls: 'danger', fn: async () => { if (!confirm('ログアウトしますか？（iPhone 内の一覧キャッシュも消します）')) return; await drive.logout(); await idb.del('items'); try { await caches.delete(thumbs.cacheName); } catch {} location.replace(redirectUri()); } },
     { label: '&#9881; クライアント ID を設定し直す', fn: () => { if (confirm('クライアント ID の設定画面に戻りますか？')) { LS.del('vault_client_id'); clearToken(); location.replace(redirectUri()); } } }
   ], info);
@@ -681,7 +780,7 @@ function openViewer(list, idx) {
   $('#vSave').onclick = () => saveItems([curItem()]);
   $('#vDel').onclick = async () => { const it = curItem(); const ok = it.trashed ? await restoreItems([it.id]) : await deleteItems([it.id]); if (!ok) return; state.view.list = state.view.list.filter((i) => i.id !== it.id); if (!state.view.list.length) return closeViewer(); state.view.idx = Math.min(state.view.idx, state.view.list.length - 1); showCurrent(); };
   $('#vInfo').onclick = () => {
-    const it = curItem(); const srcLabel = { app: 'アプリで設定', index: 'PC の索引（EXIF/動画の作成日時）', exif: '写真の EXIF', modified: '更新日時（推定）', created: 'アップロード日時（推定）' }[it.src] || it.src;
+    const it = curItem(); const srcLabel = { app: '手で直した日付', phone: 'iPhone が持っていた日付', index: 'PC の索引（EXIF/動画の作成日時）', exif: '写真の EXIF', modified: '更新日時（推定）', created: 'アップロード日時（推定）' }[it.src] || it.src;
     sheet('情報', [
       { label: '&#128197; 撮影日時を直す', fn: () => fixDate(it) },
       { label: '&#8599; Google ドライブで開く', fn: () => window.open(drive.fileLink(it), '_blank') }
@@ -734,7 +833,7 @@ async function showCurrent() {
   try {
     // まず一覧用の小さい画像を即表示 → 大きい画像に差し替え
     const small = await getThumbUrl(it, 320); if (v.token !== token) return; v.url = small; img.src = small; stage.innerHTML = ''; stage.appendChild(img);
-    const big = await getThumbUrl(it, 2048); if (v.token !== token) return; v.bigUrl = big; img.src = big;
+    const big = await getThumbUrl(it, 2048); if (v.token !== token) return; v.bigUrl = big; img.onerror = () => { img.onerror = null; img.src = small; }; img.src = big;
   } catch (e) { if (v.token === token) stage.innerHTML = `<div class="loading">表示できませんでした<br><small>${esc(e.message)}</small></div>`; }
   // 隣の画像を先読み
   for (const d of [1, -1]) { const n = v.list[v.idx + d]; if (n && !n.video) getThumbUrl(n, 2048).then((u) => URL.revokeObjectURL(u)).catch(() => {}); }
@@ -746,7 +845,7 @@ async function fixDate(it) {
   const m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?/.exec(s.trim()); if (!m) { alert('形式が違います。例: 2024-05-03 14:20'); return; }
   const nd = new Date(+m[1], +m[2] - 1, +m[3], +(m[4] || 12), +(m[5] || 0)); const iso = nd.toISOString();
   toast('<span class="spin"></span> 保存中…', 0);
-  try { await drive.setCaptured(it.id, iso); const r = state.raw.find((x) => x.id === it.id); if (r) { r.modifiedTime = iso; r.appProperties = Object.assign({}, r.appProperties, { captured: iso }); } it.app = Object.assign({}, it.app, { captured: iso }); it.modified = iso; resolveDate(it); sortItems(); syncRawFlags(); render(false); if (state.view) { state.view.list = visibleItems(); state.view.idx = Math.max(0, state.view.list.findIndex((x) => x.id === it.id)); updateViewerChrome(); } toast('撮影日時を直しました'); }
+  try { await drive.setCaptured(it.id, iso); const r = state.raw.find((x) => x.id === it.id); if (r) { r.modifiedTime = iso; r.appProperties = Object.assign({}, r.appProperties, { captured: iso, src: 'manual' }); } it.app = Object.assign({}, it.app, { captured: iso, src: 'manual' }); it.modified = iso; resolveDate(it); sortItems(); syncRawFlags(); render(false); if (state.view) { state.view.list = visibleItems(); state.view.idx = Math.max(0, state.view.list.findIndex((x) => x.id === it.id)); updateViewerChrome(); } toast('撮影日時を直しました'); }
   catch (e) { toast('失敗: ' + esc(e.message), 5000); }
 }
 
@@ -770,7 +869,7 @@ async function saveUploadLog() {
   if (DEMO || !state.vaultId || !state.token || state.tokenExp < Date.now() + 60000) return false;
   const prev = state.noRedirect; state.noRedirect = true;
   try {
-    const body = JSON.stringify({ saved: new Date().toISOString(), version: CFG.version, ua: navigator.userAgent, standalone: STANDALONE, log: upLog }, null, 1);
+    const body = JSON.stringify({ saved: new Date().toISOString(), version: CFG.version, ua: navigator.userAgent, standalone: STANDALONE, thumbs: { stats: thumbs.stats, errs: thumbs.errs, mode: thumbs.mode, map: state.thumbMap ? Object.keys(state.thumbMap).length : 0 }, log: upLog }, null, 1);
     const ex = await listAll(`name='アップロード記録.json' and '${state.vaultId}' in parents and trashed=false`, 'files(id)');
     if (ex.length) {
       await gfetch(`${UPLOAD_API}/${ex[0].id}?uploadType=media`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body });
@@ -804,10 +903,11 @@ $('#uploadBtn').onclick = () => {
     if (confirm('ログインの有効時間が残り少ないため、先にログインし直します。\n戻ってきたら、もう一度 ⇧ を押して写真を選んでください。')) { LS.set('vault_resume', { y: window.scrollY, filter: state.filter }); location.assign(authUrl()); }
     return;
   }
-  banner('pickwait', '<span class="spin"></span> 写真を選んで ✓（追加）を押すと、iPhone が写真の準備をします。<b>枚数が多いと数分かかります</b>。✓ は 1 回だけ押して、そのまま待ってください。', null, null, false);
+  banner('pickwait', '<span class="spin"></span> 写真を選んで ✓（追加）を押すと、iPhone が写真の準備をします。<b>枚数が多いと時間がかかります</b>。✓ は 1 回だけ押して、そのまま待ってください。反応がないときは 50 枚くらいずつに分けてください。', null, null, false);
+  ulog('open', { tokenMin: Math.round((state.tokenExp - Date.now()) / 60000) });
   $('#filePicker').click();
 };
-$('#filePicker').addEventListener('cancel', () => banner('pickwait', null));
+$('#filePicker').addEventListener('cancel', () => { banner('pickwait', null); ulog('cancel'); });
 $('#filePicker').addEventListener('change', async (e) => { banner('pickwait', null); const files = Array.from(e.target.files || []); e.target.value = ''; ulog('pick', { n: files.length, mb: Math.round(files.reduce((a, f) => a + f.size, 0) / 1e6), types: [...new Set(files.map((f) => f.type || '?'))].slice(0, 5), exts: [...new Set(files.map((f) => (f.name.split('.').pop() || '').toLowerCase()))].slice(0, 6), tokenMin: Math.round((state.tokenExp - Date.now()) / 60000) }); if (files.length) await uploadFiles(files); else toast('写真を受け取れませんでした。枚数を減らしてもう一度お試しください'); });
 $('#upCancel').onclick = () => { if (!confirm('アップロードを中止しますか？（送り終わった写真は残ります）')) return; upCtl.cancelled = true; for (const x of upCtl.xhrs) { try { x.abort(); } catch {} } };
 
@@ -852,7 +952,7 @@ async function putResumable(loc, file, onProgress, ctl) {
     try {
       const st = await xhrPut(loc, { 'Content-Range': `bytes */${file.size}` }, null, null, ctl);
       if (st.status >= 200 && st.status < 300) { report(file.size); return parseJSON(st.responseText); }
-      if (st.status === 308) start = rangeEnd(st);
+      if (st.status === 308) { const got = rangeEnd(st); if (got > start) fails = 0; start = got; } // 進んでいれば、失敗の数え直し（遅い回線で打ち切らない）
       else if (st.status === 404 || st.status === 410) throw new Error('アップロードの受付が切れました');
     } catch (e) { if (e.message === 'cancelled' || /受付が切れ/.test(e.message)) throw e; }
     report(start);
